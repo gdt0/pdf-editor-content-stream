@@ -200,7 +200,157 @@ The current implementation is a Python library and a web server. A thin CLI wrap
 
 ---
 
-## 8. What this enables
+## 9. What was built on top of pikepdf
+
+`pikepdf` provides two critical primitives:
+- `parse_content_stream(page)` — parses a page's binary content stream into a Python list of `(operands, operator)` tuples
+- `unparse_content_stream(instructions)` — serializes the list back to binary
+
+These are the **only** pikepdf functions used. Everything else in this project is custom-built to handle real-world PDF complexity:
+
+### 9.1 ToUnicode CMap parser (`_parse_tounicode_cmap`)
+
+pikepdf gives access to the raw ToUnicode stream bytes. But parsing the CMap format is entirely custom code. The CMap is a PostScript-like text format with two relevant sections:
+
+**bfchar blocks** — one-to-one mappings:
+```
+39 beginbfchar
+<0027> <0044>
+<0055> <0072>
+...
+endbfchar
+```
+
+**bfrange blocks** — range mappings:
+```
+2 beginbfrange
+<0000> <0040> <0041>
+<0100> <0120> <0200>
+endbfrange
+```
+
+The custom parser uses regex to extract CID→Unicode pairs from both block types. Range blocks are expanded into individual mappings. Invalid Unicode code points (`>= 0x110000`) are skipped — a real-world edge case found in production PDFs that would crash naive implementations.
+
+### 9.2 Font tracking across the content stream
+
+PDF content streams are stateful — a `Tf` operator sets the "current font" and all subsequent `Tj`/`TJ` operators use that font until the next `Tf`. The code walks instructions sequentially, tracking `current_font` by watching for `Tf` operators:
+
+```python
+if op == "Tf" and len(operands) >= 1:
+    current_font = str(operands[0]).lstrip("/")
+```
+
+This is critical because different sections of a page use different fonts (heading font vs body font), and each font has its own ToUnicode CMap.
+
+### 9.3 CID string decode/encode (`_decode_cid`, `_encode_cid`)
+
+CIDs are stored as 2-byte big-endian integers. The decode function reads 2 bytes at a time, looks up the CID in the font's `cid2uni` dictionary, and builds a Unicode string:
+
+```python
+cid = (raw_bytes[i] << 8) | raw_bytes[i + 1]
+result.append(cid2uni.get(cid, ""))
+```
+
+The encode function does the reverse — looks up each Unicode character in `uni2cid` and writes the 2-byte CID. Characters not available in the subset font are silently skipped.
+
+### 9.4 TJ array reconstruction for text replacement
+
+This is the most complex piece. A `TJ` array contains interleaved string elements and numeric kerning offsets:
+
+```
+[(S) 5 (A) 3 (N) 2 (K) 4 (E) 7 (T)] TJ   ← "SANKET" with per-character spacing
+```
+
+To replace "SANKET" with "Sachin":
+
+1. **Concatenate all string elements** into one Unicode string, tracking each element's position
+2. **Find the target** in the concatenated text, identify which element holds the first character
+3. **Place the entire replacement** into the first matching element
+4. **Zero out** all subsequent elements that held the old text
+5. **Shift positions** for subsequent replacements on the same TJ array
+
+The tricky part: the replacement text may be a different length than the original. After replacement, the kerning offsets for following text will apply slightly differently, but this is a negligible visual change (<1 pixel for most pairs).
+
+### 9.5 Content stream write-back
+
+After modifying the instruction list, two steps write it back:
+
+```python
+new_stream = unparse_content_stream(instructions)
+page.Contents = pdf.make_stream(new_stream)
+```
+
+`unparse_content_stream` serializes the Python objects back to binary PDF operators. `pdf.make_stream()` creates a proper PDF stream object from the binary data. Finally, `pdf.save()` writes the complete file, preserving all untouched objects byte-for-byte.
+
+---
+
+## 10. Detailed limitations
+
+### 10.1 Subset font glyph availability (CRITICAL)
+
+**What:** PDF fonts are subsetted — they only contain glyphs actually used in the original document.
+
+**Impact:** If you try to replace "SANKET" with "Zack" but the font doesn't have a 'Z' glyph, the replacement partially fails or is silently corrupted.
+
+**Detection:** The code checks `uni2cid` for every character in the replacement text before encoding. Missing glyphs are skipped, which means the replacement character simply won't appear in the output.
+
+**Real-world frequency:** Common in professionally designed PDFs where fonts are aggressively subsetted. A typical resume font has 60-70 glyphs — enough for most edits but will fail on unusual characters or symbols not in the original.
+
+**Workaround:** None within the content stream approach. Adding glyphs to an existing subset font requires font tools like `fonttools`, which is a fundamentally different problem.
+
+### 10.2 Text split across operators (COMMON)
+
+**What:** PDF generators often split text across multiple `Tj`/`TJ` operators. A single visible paragraph might be 20 separate drawing commands.
+
+**Impact:** If "SANKET" spans two separate `TJ` operators, the current code won't match it because it searches within individual operators.
+
+**Detection:** The function returns `ValueError("No replacements made")` when no matches are found. The error message hints that text may be split.
+
+**Real-world frequency:** Very common in PDFs from Microsoft Word, Adobe InDesign, and most professional tools. LaTeX PDFs are less fragmented.
+
+**Fix (not yet implemented):** Detect consecutive text operators at the same vertical position (same Y-coordinate), concatenate their text, perform the replacement across the group, then redistribute.
+
+### 10.3 Missing ToUnicode CMaps (RARE)
+
+**What:** Some PDFs use fonts without a `/ToUnicode` stream, especially older PDFs or those using standard 14 fonts (Times, Helvetica, Courier).
+
+**Impact:** Without a CMap, there is no way to determine what Unicode character a given CID represents. These PDFs cannot be edited.
+
+**Real-world frequency:** Rare in modern PDFs. The PDF/A standard requires ToUnicode CMaps. Standard 14 fonts can sometimes be decoded using their built-in encoding tables, but this is not yet implemented.
+
+### 10.4 Kerning offset drift after replacement
+
+**What:** When the replacement text has a different length than the original, the kerning offsets between the replacement area and following text apply at the wrong character positions.
+
+**Impact:** The text after the replacement may shift by 1-3 pixels. This is usually invisible to the naked eye but measurable in pixel-diff comparisons.
+
+**Real-world frequency:** Every replacement where `len(new) != len(old)`. The effect is proportional to the length difference and the kerning values — larger differences cause more visible shifts.
+
+### 10.5 Text in XObject Forms
+
+**What:** PDFs can store reusable content in Form XObjects (similar to "symbols" or "components"). Text inside a Form XObject is not in the page's main content stream.
+
+**Impact:** Text stored in Form XObjects will not be found or replaced. This is common in PDFs with headers/footers, watermarks, or repeated elements.
+
+**Fix (not yet implemented):** Recursively walk the `/Resources` dictionary for Form XObjects and process their content streams the same way as page streams.
+
+### 10.6 Encrypted / password-protected PDFs
+
+**What:** PDFs with owner or user passwords.
+
+**Impact:** pikepdf can open some encrypted PDFs but may fail if the encryption is strong. PDFs with edit restrictions (owner password) can be read but not saved.
+
+### 10.7 No parallel / batch processing
+
+**What:** The library processes one PDF at a time, single-threaded.
+
+**Impact:** Processing 1000 PDFs takes 1000x the time of one. Each file goes through CMap parsing, content stream parsing, replacement, and save independently.
+
+**Fix (not yet implemented):** Multiprocessing wrapper using `concurrent.futures.ProcessPoolExecutor`.
+
+---
+
+## 11. What this enables
 
 - **Legal documents**: Change party names or dates in executed contracts without invalidating formatting
 - **Certificates**: Programmatically fill names into pre-designed certificate PDFs
