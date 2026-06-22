@@ -1,0 +1,106 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>PDF Text Editor — Content Stream</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:-apple-system,BlinkMacSystemFont,sans-serif;background:#111;color:#eee;min-height:100vh;display:flex;flex-direction:column;align-items:center;padding:40px 16px}
+h1{font-size:22px;margin-bottom:6px;color:#fff}
+.sub{color:#888;font-size:13px;margin-bottom:32px;text-align:center}
+.card{background:#1a1a1a;border:1px solid #333;border-radius:12px;padding:24px;width:100%;max-width:520px;margin-bottom:16px}
+.card h2{font-size:16px;margin-bottom:12px;color:#ccc}
+input[type=file]{display:block;width:100%;padding:12px;border:1px dashed #444;border-radius:8px;cursor:pointer;margin-bottom:16px;font-size:14px;background:#222;color:#aaa}
+input[type=file]::file-selector-button{padding:8px 16px;border-radius:6px;border:none;background:#2563eb;color:#fff;cursor:pointer;margin-right:12px}
+.row{display:flex;gap:8px;margin-bottom:10px;align-items:center}
+.row input{flex:1;padding:10px 12px;border:1px solid #444;border-radius:6px;font-size:14px;background:#222;color:#eee}
+.row button{padding:10px 16px;border:1px solid #444;border-radius:6px;background:#331111;color:#f66;cursor:pointer;font-size:14px;font-weight:600}
+.add-btn{display:inline-block;padding:8px 16px;border:1px dashed #2563eb;border-radius:6px;background:none;color:#2563eb;cursor:pointer;font-size:13px;margin-bottom:16px}
+.btn{display:block;width:100%;padding:14px;border:none;border-radius:8px;font-size:15px;font-weight:600;cursor:pointer}
+.btn-primary{background:#2563eb;color:#fff}
+.btn-primary:disabled{background:#1e3a5f;cursor:not-allowed}
+.status{margin-top:12px;padding:10px;border-radius:8px;font-size:13px;display:none}
+.status.ok{background:#112211;color:#4ade80;display:block}
+.status.err{background:#221111;color:#f87171;display:block}
+small{color:#666;font-size:12px;display:block;margin-top:6px;line-height:1.5}
+code{background:#222;padding:2px 6px;border-radius:4px;font-size:12px}
+</style>
+</head>
+<body>
+<h1>PDF Content Stream Editor</h1>
+<p class="sub">Zero format change — edits raw PDF operators directly</p>
+
+<div class="card">
+  <h2>Upload PDF</h2>
+  <input type="file" id="pdfFile" accept=".pdf">
+
+  <h2>Find & Replace</h2>
+  <div id="rows">
+    <div class="row">
+      <input type="text" placeholder="Find text..." class="find">
+      <input type="text" placeholder="Replace with..." class="replace">
+      <button onclick="removeRow(this)">✕</button>
+    </div>
+  </div>
+  <button class="add-btn" onclick="addRow()">+ Add another</button>
+
+  <button class="btn btn-primary" id="btn" onclick="apply()">
+    Apply Changes & Download
+  </button>
+  <div class="status" id="status"></div>
+  <small>
+    How it works: parses each font's ToUnicode CMap, decodes CID-encoded text in Tj/TJ operators,
+    replaces text in Unicode, re-encodes to CIDs. Only text bytes change — fonts, positions,
+    colors, and everything else is untouched. <br><br>
+    <strong>Limitation:</strong> Subset fonts only contain glyphs used in the original PDF.
+    Replacement text must use characters that already appear in the document.
+  </small>
+</div>
+
+<script>
+function addRow(){
+  const d=document.createElement('div')
+  d.className='row'
+  d.innerHTML='<input type="text" placeholder="Find text..." class="find"><input type="text" placeholder="Replace with..." class="replace"><button onclick="removeRow(this)">✕</button>'
+  document.getElementById('rows').appendChild(d)
+}
+function removeRow(b){
+  const rows=document.querySelectorAll('.row')
+  if(rows.length>1) b.parentElement.remove()
+}
+async function apply(){
+  const file=document.getElementById('pdfFile').files[0]
+  if(!file) return show('Select a PDF file','err')
+  const reps={}
+  document.querySelectorAll('.row').forEach(r=>{
+    const f=r.querySelector('.find').value.trim()
+    const t=r.querySelector('.replace').value.trim()
+    if(f) reps[f]=t
+  })
+  if(!Object.keys(reps).length) return show('Enter at least one pair','err')
+  const btn=document.getElementById('btn')
+  btn.disabled=true; btn.textContent='Processing...'
+  const fd=new FormData()
+  fd.append('file',file)
+  fd.append('replacements',JSON.stringify(reps))
+  try{
+    const res=await fetch('/api/edit',{method:'POST',body:fd})
+    if(!res.ok) throw new Error((await res.text()).slice(0,300))
+    const blob=await res.blob()
+    const url=URL.createObjectURL(blob)
+    const a=document.createElement('a')
+    a.href=url; a.download='edited.pdf'; a.click()
+    URL.revokeObjectURL(url)
+    show('Done! PDF downloaded.','ok')
+  }catch(e){show(e.message,'err')}
+  btn.disabled=false; btn.textContent='Apply Changes & Download'
+}
+function show(msg,t){
+  const el=document.getElementById('status')
+  el.className='status '+t
+  el.innerHTML=msg
+}
+</script>
+</body>
+</html>
