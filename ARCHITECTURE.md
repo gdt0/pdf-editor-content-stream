@@ -120,10 +120,14 @@ For each `Tj` (show string) or `TJ` (show string array with kerning) operator, c
 
 **Step 4: Find and replace**
 
-Search the decoded Unicode text for target strings. When found:
+Consecutive text-show operators (`Tj`/`TJ`) belonging to the same text block are
+accumulated into a single buffer, so a target string may be matched even when it
+is split across several operators. Search the concatenated decoded Unicode for
+target strings. When found:
 - Encode the replacement text back to CID bytes using `uni2cid`
-- Place the entire replacement in the first string element
-- Zero out all subsequent elements that held the old text
+- Place the entire replacement in the operand that holds the match start
+- Clear every intermediate operand inside the match range
+- Preserve the tail of the operand that holds the match end
 - This preserves the kerning offsets for everything after the replacement
 
 **Step 5: Serialize and save**
@@ -163,9 +167,18 @@ PDFs often fragment text across multiple `Tj`/`TJ` operators, especially when:
 - Text spans line breaks
 - The PDF generator's output engine splits text for optimization
 
-The current implementation handles text within a single `TJ` array but not text split across multiple separate operators.
+This is now handled by a **text-block accumulator** (see §9.4). The editor
+collects consecutive text-show operators that belong to the same text block,
+concatenates their decoded Unicode, applies replacements across the combined
+string, and writes the modified CID bytes back into the original operands while
+leaving every untouched operator byte-for-byte identical.
 
-**Mitigation:** Concatenate text from consecutive operators belonging to the same text block. This requires tracking text matrix (`Tm`) and line position changes.
+**Remaining edge cases:** matching is intentionally conservative and still
+cannot span an arbitrary layout change. A block is flushed — ending the matchable
+region — whenever the font changes, a non-text operator appears, or text
+positioning moves to a new line/paragraph. So a target string that is broken
+across a line wrap, a font switch, an XObject boundary (§10.5), or any
+intervening graphics operator will not match.
 
 ### 6.3 Character-by-character TJ arrays
 
@@ -253,21 +266,40 @@ result.append(cid2uni.get(cid, ""))
 
 The encode function does the reverse — looks up each Unicode character in `uni2cid` and writes the 2-byte CID. Characters not available in the subset font are silently skipped.
 
-### 9.4 TJ array reconstruction for text replacement
+### 9.4 Text-block accumulation and array reconstruction
 
-This is the most complex piece. A `TJ` array contains interleaved string elements and numeric kerning offsets:
+This is the most complex piece. Text to be matched can be spread across both the
+elements of a single `TJ` array *and* across several separate `Tj`/`TJ`
+operators. A `TJ` array contains interleaved string elements and numeric kerning
+offsets:
 
 ```
 [(S) 5 (A) 3 (N) 2 (K) 4 (E) 7 (T)] TJ   ← "SANKET" with per-character spacing
 ```
 
-To replace "SANKET" with "Sachin":
+…and the same word might instead be split as `(SAN) Tj` followed by `(KET) Tj`.
 
-1. **Concatenate all string elements** into one Unicode string, tracking each element's position
-2. **Find the target** in the concatenated text, identify which element holds the first character
-3. **Place the entire replacement** into the first matching element
-4. **Zero out** all subsequent elements that held the old text
-5. **Shift positions** for subsequent replacements on the same TJ array
+To handle both, the editor walks the content stream and maintains a **text-block
+accumulator**. Every string operand it can decode — whether a plain `Tj` or an
+individual element of a `TJ` array — becomes a *slot*: a unit of text bound to
+the exact operand it came from. Consecutive slots are buffered into one block:
+
+1. **Accumulate** consecutive `Tj`/`TJ` slots while the font and text-line
+   position are unchanged, tracking each slot's position in the concatenated text
+2. **Flush** the block — i.e. search and rewrite it — when the font changes
+   (`Tf`), a non-text operator appears, or positioning (`Tm`, `Td`/`TD`, `T*`)
+   moves to a new line/paragraph
+3. **Find the target** in the concatenated text; identify the slot holding the
+   match start and the slot holding the match end (these may be different
+   operators)
+4. **Place the entire replacement** into the start slot's operand (after its
+   preserved prefix)
+5. **Clear** every intermediate slot inside the match range
+6. **Preserve the tail** of the end slot (the text after the match)
+7. **Rewrite only modified operands** — each `Tj` becomes a new
+   `ContentStreamInstruction`; each touched `TJ` array is rebuilt keeping its
+   numeric kerning elements and untouched strings intact. Operators with no
+   change are left byte-for-byte identical.
 
 The tricky part: the replacement text may be a different length than the original. After replacement, the kerning offsets for following text will apply slightly differently, but this is a negligible visual change (<1 pixel for most pairs).
 
@@ -298,17 +330,19 @@ page.Contents = pdf.make_stream(new_stream)
 
 **Workaround:** None within the content stream approach. Adding glyphs to an existing subset font requires font tools like `fonttools`, which is a fundamentally different problem.
 
-### 10.2 Text split across operators (COMMON)
+### 10.2 Text split across operators (COMMON — handled)
 
 **What:** PDF generators often split text across multiple `Tj`/`TJ` operators. A single visible paragraph might be 20 separate drawing commands.
 
-**Impact:** If "SANKET" spans two separate `TJ` operators, the current code won't match it because it searches within individual operators.
+**Impact:** If "SANKET" spans two separate `Tj`/`TJ` operators, it is still matched: a text-block accumulator (§9.4) concatenates consecutive text-show operators in the same block before searching, then writes the replacement back across the original operands.
 
-**Detection:** The function returns `ValueError("No replacements made")` when no matches are found. The error message hints that text may be split.
+**Detection:** The function returns `ValueError("No replacements made")` only when no match is found anywhere — for example because the target text genuinely crosses a block boundary (see below) or uses an unparseable encoding.
 
 **Real-world frequency:** Very common in PDFs from Microsoft Word, Adobe InDesign, and most professional tools. LaTeX PDFs are less fragmented.
 
-**Fix (not yet implemented):** Detect consecutive text operators at the same vertical position (same Y-coordinate), concatenate their text, perform the replacement across the group, then redistribute.
+**How it works:** Walk the stream tracking the active font and the text-line position. Accumulate consecutive `Tj`/`TJ` text into one buffer and flush (search + rewrite) the buffer when the font changes (`Tf`), when a non-text operator appears, or when positioning (`Tm`, `Td`/`TD`, `T*`) moves to a new line. A purely horizontal `Td` keeps the same block; a vertical move starts a new one.
+
+**Remaining limitation:** Matching is conservative and does not span an arbitrary layout change — text broken across a line wrap, a font switch, an XObject boundary, or any intervening graphics operator still will not match. Spanning those would require modeling the full page layout rather than the linear operator stream.
 
 ### 10.3 Missing ToUnicode CMaps (RARE)
 

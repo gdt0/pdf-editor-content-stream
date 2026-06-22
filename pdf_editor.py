@@ -83,9 +83,91 @@ def _encode_cid(text: str, uni2cid: dict) -> bytes:
     return bytes(result)
 
 
+_Y_EPS = 1e-3
+
+
+def _slots_full_text(slots: list) -> tuple:
+    """Concatenate slot texts → (full_text, offsets) where offsets[i] is the
+    starting index of slot i within full_text."""
+    offsets = []
+    pos = 0
+    for slot in slots:
+        offsets.append(pos)
+        pos += len(slot["text"])
+    return "".join(slot["text"] for slot in slots), offsets
+
+
+def _slot_at(slots: list, offsets: list, char_pos: int):
+    """Return the index of the slot containing absolute char position."""
+    for idx, slot in enumerate(slots):
+        start = offsets[idx]
+        if start <= char_pos < start + len(slot["text"]):
+            return idx
+    return None
+
+
+def _apply_to_slots(slots: list, old: str, new: str, uni2cid: dict) -> int:
+    """Replace ``old`` with ``new`` across the concatenated text of ``slots``.
+
+    The match may span multiple slots (i.e. multiple Tj/TJ operands). The whole
+    replacement is written into the slot holding the match start; intermediate
+    slots are cleared; the tail of the slot holding the match end is preserved.
+    Slots whose text changes are flagged ``modified`` so only those operands are
+    rewritten. Returns the number of replacements made.
+    """
+    if not old:
+        return 0
+    if any(ch not in uni2cid for ch in new):
+        # Replacement contains a glyph the subset font cannot encode.
+        return 0
+
+    count = 0
+    search_start = 0
+    while True:
+        full_text, offsets = _slots_full_text(slots)
+        pos = full_text.find(old, search_start)
+        if pos == -1:
+            break
+
+        end_pos = pos + len(old)
+        i = _slot_at(slots, offsets, pos)
+        j = _slot_at(slots, offsets, end_pos - 1)
+        if i is None or j is None:
+            search_start = pos + 1
+            continue
+
+        prefix = slots[i]["text"][: pos - offsets[i]]
+        suffix = slots[j]["text"][end_pos - offsets[j]:]
+
+        if i == j:
+            slots[i]["text"] = prefix + new + suffix
+            slots[i]["modified"] = True
+        else:
+            slots[i]["text"] = prefix + new
+            slots[i]["modified"] = True
+            for k in range(i + 1, j):
+                if slots[k]["text"]:
+                    slots[k]["text"] = ""
+                    slots[k]["modified"] = True
+            slots[j]["text"] = suffix
+            slots[j]["modified"] = True
+
+        count += 1
+        search_start = pos + len(new)
+
+    return count
+
+
 def edit_pdf(input_path: str, output_path: str, replacements: dict) -> dict:
     """
     Edit text in a PDF by modifying content stream operators directly.
+
+    Text is matched across consecutive ``Tj``/``TJ`` operators that belong to
+    the same text block. Consecutive text-show operators are accumulated while
+    the font and text line position stay the same; the block is flushed (its
+    accumulated text searched and rewritten) when the font changes, when a
+    non-text operator appears, or when text positioning moves to a new line or
+    paragraph.
 
     Args:
         input_path: Path to input PDF
@@ -93,7 +175,7 @@ def edit_pdf(input_path: str, output_path: str, replacements: dict) -> dict:
         replacements: Dict of {old_text: new_text} to replace
 
     Returns:
-        dict with 'replacements_made' count and any 'missing_glyphs'
+        dict with 'replacements_made' count
 
     Raises:
         ValueError: If no replacements were made (text not found or encoding issue)
@@ -112,89 +194,119 @@ def edit_pdf(input_path: str, output_path: str, replacements: dict) -> dict:
             continue
 
         current_font = None
+        block_slots: list = []
+        block_uni2cid: dict = {}
+        block_y = None  # text-line y at which the current block started
+        current_y = 0.0
 
-        for operands, operator in instructions:
+        def flush():
+            nonlocal total, block_slots, block_y
+            if block_slots:
+                for old, new in replacements.items():
+                    total += _apply_to_slots(block_slots, old, new, block_uni2cid)
+                # Rebuild only the operators whose text actually changed; every
+                # untouched instruction is left byte-for-byte identical.
+                tj_changes: dict = {}
+                tj_array_changes: dict = {}
+                for slot in block_slots:
+                    if not slot["modified"]:
+                        continue
+                    encoded = _encode_cid(slot["text"], block_uni2cid)
+                    if slot["kind"] == "Tj":
+                        tj_changes[slot["op_index"]] = encoded
+                    else:
+                        tj_array_changes.setdefault(slot["op_index"], {})[
+                            slot["arr_index"]
+                        ] = encoded
+                for op_index, encoded in tj_changes.items():
+                    instructions[op_index] = pikepdf.ContentStreamInstruction(
+                        [pikepdf.String(encoded)], pikepdf.Operator("Tj")
+                    )
+                for op_index, changes in tj_array_changes.items():
+                    original = instructions[op_index].operands[0]
+                    new_elems = [
+                        pikepdf.String(changes[ei]) if ei in changes else elem
+                        for ei, elem in enumerate(original)
+                    ]
+                    instructions[op_index] = pikepdf.ContentStreamInstruction(
+                        [pikepdf.Array(new_elems)], pikepdf.Operator("TJ")
+                    )
+            block_slots = []
+            block_y = None
+
+        for op_index, (operands, operator) in enumerate(instructions):
             op = str(operator)
 
-            if op == "Tf" and len(operands) >= 1:
-                current_font = str(operands[0]).lstrip("/")
+            # ── Text block / line positioning state ──
+            if op == "BT":
+                flush()
+                current_y = 0.0
+                continue
+            if op == "ET":
+                flush()
+                continue
+            if op == "Tf":
+                flush()
+                if len(operands) >= 1:
+                    current_font = str(operands[0]).lstrip("/")
+                continue
+            if op in ("Td", "TD"):
+                if len(operands) >= 2:
+                    current_y += float(operands[1])
+                if block_slots and block_y is not None and abs(current_y - block_y) > _Y_EPS:
+                    flush()
+                continue
+            if op == "Tm":
+                if len(operands) >= 6:
+                    current_y = float(operands[5])
+                    skewed = abs(float(operands[1])) > _Y_EPS or abs(float(operands[2])) > _Y_EPS
+                else:
+                    skewed = False
+                if block_slots and (skewed or block_y is None or abs(current_y - block_y) > _Y_EPS):
+                    flush()
                 continue
 
-            if current_font not in font_maps:
-                continue
-
-            maps = font_maps[current_font]
-            cid2uni = maps["cid2uni"]
-            uni2cid = maps["uni2cid"]
-
-            # ── Tj: simple string ──
+            # ── Text-show operators: accumulate into the current block ──
             if op == "Tj" and len(operands) == 1:
-                decoded = _decode_cid(bytes(operands[0]), cid2uni)
-                new_decoded = decoded
-                for old, new in replacements.items():
-                    new_decoded = new_decoded.replace(old, new)
-                if new_decoded != decoded:
-                    encoded = _encode_cid(new_decoded, uni2cid)
-                    if encoded:
-                        operands[0] = pikepdf.String(encoded)
-                        total += 1
-
-            # ── TJ: array with kerning offsets ──
-            elif op == "TJ" and len(operands) == 1:
-                arr = operands[0]
-                if not isinstance(arr, pikepdf.Array):
+                if current_font not in font_maps:
+                    flush()
                     continue
+                maps = font_maps[current_font]
+                if not block_slots:
+                    block_uni2cid = maps["uni2cid"]
+                    block_y = current_y
+                block_slots.append({
+                    "kind": "Tj",
+                    "op_index": op_index,
+                    "text": _decode_cid(bytes(operands[0]), maps["cid2uni"]),
+                    "modified": False,
+                })
+                continue
 
-                # Decode all string elements
-                str_parts = []
-                full_text = ""
+            if op == "TJ" and len(operands) == 1:
+                arr = operands[0]
+                if current_font not in font_maps or not isinstance(arr, pikepdf.Array):
+                    flush()
+                    continue
+                maps = font_maps[current_font]
+                if not block_slots:
+                    block_uni2cid = maps["uni2cid"]
+                    block_y = current_y
                 for elem_idx, elem in enumerate(arr):
                     if isinstance(elem, pikepdf.String):
-                        decoded = _decode_cid(bytes(elem), cid2uni)
-                        str_parts.append((elem_idx, decoded, len(full_text)))
-                        full_text += decoded
+                        block_slots.append({
+                            "kind": "TJ",
+                            "op_index": op_index,
+                            "arr_index": elem_idx,
+                            "text": _decode_cid(bytes(elem), maps["cid2uni"]),
+                            "modified": False,
+                        })
+                continue
 
-                # Apply replacements
-                for old, new in replacements.items():
-                    search_start = 0
-                    while True:
-                        pos = full_text.find(old, search_start)
-                        if pos == -1:
-                            break
+            # ── Any other operator ends the current text block ──
+            flush()
 
-                        end_pos = pos + len(old)
-                        first_elem = None
-                        for ei, edec, estart in str_parts:
-                            if estart <= pos < estart + len(edec):
-                                first_elem = (ei, estart, len(edec))
-                                break
-                        if not first_elem:
-                            break
-
-                        first_ei, first_start, first_len = first_elem
-                        prefix = full_text[first_start:pos]
-                        new_first_text = prefix + new
-
-                        if all(ch in uni2cid for ch in new_first_text):
-                            arr[first_ei] = pikepdf.String(
-                                _encode_cid(new_first_text, uni2cid)
-                            )
-                            for ei, edec, estart in str_parts:
-                                if estart > first_start and estart < end_pos:
-                                    arr[ei] = pikepdf.String(b"")
-                                elif estart >= end_pos:
-                                    break
-                            total += 1
-
-                        # Update full_text for subsequent searches
-                        full_text = full_text[:pos] + new + full_text[end_pos:]
-                        delta = len(new) - len(old)
-                        new_parts = []
-                        for ei, edec, estart in str_parts:
-                            offset = delta if estart >= pos else 0
-                            new_parts.append((ei, edec, estart + offset))
-                        str_parts = new_parts
-                        search_start = pos + len(new)
+        flush()
 
         # Write modified stream back
         try:
@@ -207,8 +319,9 @@ def edit_pdf(input_path: str, output_path: str, replacements: dict) -> dict:
 
     if total == 0:
         raise ValueError(
-            "No replacements made. The target text may be split across "
-            "operators or uses an encoding this tool cannot parse."
+            "No replacements made. The target text may span a layout change "
+            "(e.g. a new line or font switch) or uses an encoding this tool "
+            "cannot parse."
         )
 
     return {"replacements_made": total}
