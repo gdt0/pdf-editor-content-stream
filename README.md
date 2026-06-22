@@ -72,7 +72,7 @@ curl -F "file=@resume.pdf" \
 ## Limitations
 
 - **Subset fonts** — PDF fonts typically only contain glyphs used in the original document. Replacement characters must exist in the font's glyph set. If a replacement character isn't available, it will be omitted.
-- **Text fragmentation** — some PDFs split text across multiple Tj/TJ operators or encode it in complex ways. If no replacements are made, the `ValueError` explains why.
+- **Text fragmentation** — text split across consecutive Tj/TJ operators in the same text block is now matched and replaced via a text-block accumulator. Matching is still conservative: a target that crosses a line break, a font switch, or any non-text operator is not matched. If no replacements are made, the `ValueError` explains why.
 - **Non-standard encodings** — fonts without a ToUnicode CMap cannot be decoded.
 
 ## Pixel difference in testing
