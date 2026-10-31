@@ -20,7 +20,8 @@
     {
       "details": {
         "changed_strings": 1,
-        "pages_checked": 1
+        "pages_checked": 1,
+        "positioning_ops_changed": 0
       },
       "name": "stream_diff",
       "passed": true

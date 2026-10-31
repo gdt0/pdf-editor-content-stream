@@ -48,8 +48,7 @@
         "SANKET\u00a0DAWAR": "SACHIN\u00a0KUMAR"
       },
       "expect": {
-        "mode": "error",
-        "message_contains": "not found"
+        "mode": "ok"
       }
     },
     {
@@ -102,6 +101,26 @@
       "expect": {
         "mode": "error",
         "message_contains": "missing"
+      }
+    },
+    {
+      "name": "f8_shift",
+      "file": "F8_positioned_runs.pdf",
+      "replacements": {
+        "world": "wonderful"
+      },
+      "expect": {
+        "mode": "ok"
+      }
+    },
+    {
+      "name": "f9_reflow",
+      "file": "F9_reflow.pdf",
+      "replacements": {
+        "alpha": "alpha-much-longer"
+      },
+      "expect": {
+        "mode": "ok"
       }
     }
   ]

@@ -90,11 +90,31 @@ pip install -r requirements-dev.txt
 pytest
 ```
 
+## Phase 3: text model, fit policy, limited reflow
+
+Edits run through a positioned token model (`textmodel.py`): text is
+decoded across operator boundaries into lines with real x/y positions
+(full state tracking: CTM, Tm/Td/TD/T*, Tc/Tw/Tz/Ts, Tf).
+
+- **Cross-operator matching** — a target fragmented across separate
+  operators on one line is matched and replaced (occurrence identity via
+  `find_pdf(path, query)`).
+- **Width measurement + run shifting** (`widths.py`) — glyph advances from
+  /Widths, /W (+/DW default), embedded hmtx/CFF via fontTools, or MuPDF's
+  base-14 metrics. When a replacement widens the line, same-flow
+  positioned runs after the edit shift by exactly the measured delta.
+- **Fit policy with limited reflow** — soft boundary = the page's original
+  text extent; a widening edit first moves trailing words to the
+  continuation line (a real re-wrap); growth up to the hard page edge is
+  allowed; beyond it the edit is **refused with DOES_NOT_FIT** — refusal
+  is a first-class outcome, never silent overflow.
+- **Form XObjects and annotation /AP streams** are traversed and editable.
+
 ## Limitations
 
-- **Subset fonts** — replacement characters must exist in the font's glyph set. Unlike before, this is now *detected*: the replacement is refused and `missing_glyphs` names the absent characters; other replacements still apply.
-- **Text split across operators** — a sentence fragmented across separate `Tj`/`TJ` operators is not matched yet (reported as not-found). Rebuilding matches across operators is the Phase 3 text model.
-- **Line shifts** — a replacement with a different width shifts the remainder of its line; the pixel check masks edited *lines*, not just words, until a fit policy exists.
+- **Subset fonts** — replacement characters must exist in the font's glyph set; refusals name the absent characters in `missing_glyphs`.
+- **Word-order verification** — reflowed edits are verified by word multiset (order changes across line wraps by design); non-reflowed edits verify exact extraction.
+- **Reflow is line-scoped** — moved words go to the immediate continuation line only; multi-line cascading reflow is out of scope.
 - **Non-standard encodings** — fonts with no ToUnicode and no supported `/Encoding` are refused and listed in `fonts_skipped`.
 - **MacRomanEncoding** is decoded via the classic Mac OS Roman table; a few high slots may differ from the PDF spec variant.
 

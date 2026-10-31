@@ -140,8 +140,12 @@ def _operands_differ(aops, bops):
     return None
 
 
-def _check_stream_diff(original, edited):
-    details = {"pages_checked": 0, "changed_strings": 0}
+_POS_OPS = ("Tm", "Td", "TD", "T*")
+
+
+def _check_stream_diff(original, edited, allow_positioning=False):
+    details = {"pages_checked": 0, "changed_strings": 0,
+               "positioning_ops_changed": 0}
     ok = True
     old_pdf = pikepdf.open(original)
     new_pdf = pikepdf.open(edited)
@@ -179,6 +183,11 @@ def _check_stream_diff(original, edited):
                     continue
                 diff = _operands_differ(ao, bo)
                 if diff is not None:
+                    if allow_positioning and aname in _POS_OPS:
+                        # the editor intentionally moved positioned runs by
+                        # the measured width delta — declared and audited
+                        details["positioning_ops_changed"] += 1
+                        continue
                     ok = False
                     details["non_text_operand_changed"] = {
                         "page": pno, "index": idx, "operator": aname, "diff": diff
@@ -201,7 +210,7 @@ def _normalize_ws(s):
     return " ".join(s.split())
 
 
-def _check_text_extract(original, edited, applied):
+def _check_text_extract(original, edited, applied, mode="exact"):
     details = {"pages_checked": 0, "mismatches": []}
     ok = True
     odo, ndo = fitz.open(original), fitz.open(edited)
@@ -214,7 +223,10 @@ def _check_text_extract(original, edited, applied):
             for old, new in applied.items():
                 expected = expected.replace(old, new)
             if expected != tn:
-                if _normalize_ws(expected) == _normalize_ws(tn):
+                if mode == "words" and sorted(expected.split()) == sorted(tn.split()):
+                    # reflowed edit: words moved across lines but none lost
+                    details.setdefault("word_multiset_pages", []).append(pno)
+                elif _normalize_ws(expected) == _normalize_ws(tn):
                     details.setdefault("whitespace_normalized_pages", []).append(pno)
                 else:
                     ok = False
@@ -279,7 +291,30 @@ def _mask_boxes(page, texts, dpi):
     return boxes, located_all
 
 
-def _check_pixel_diff(original, edited, applied, dpi_list):
+def _touched_boxes(page, regions, pno, dpi):
+    """Pixel boxes for editor-declared touched regions (content-space bands).
+
+    Content space is y-up; the pixmap is y-down. Only applied when the page
+    has no /Rotate (rotation handling is a documented limitation).
+    """
+    if page.rotation != 0:
+        return [], False
+    try:
+        h = page.mediabox.height
+    except Exception:
+        return [], False
+    scale = dpi / 72.0
+    boxes = []
+    for r in regions or []:
+        if r.get("page") is not None and r["page"] != pno + 1:
+            continue
+        y0 = max(0.0, (h - r["y1"]) * scale)
+        y1 = min(h * scale, (h - r["y0"]) * scale)
+        boxes.append((0, int(y0), int(page.rect.width * scale), int(y1) + 1))
+    return boxes, True
+
+
+def _check_pixel_diff(original, edited, applied, dpi_list, touched_regions=None):
     details = {"dpi": list(dpi_list), "outside_mask_pixels": 0}
     ok = True
     warnings = []
@@ -301,8 +336,14 @@ def _check_pixel_diff(original, edited, applied, dpi_list):
                 diff = np.any(a != b, axis=2)
                 old_boxes, old_ok = _mask_boxes(odo[pno], list(applied.keys()), dpi)
                 new_boxes, new_ok = _mask_boxes(ndo[pno], list(applied.values()), dpi)
-                boxes = old_boxes + new_boxes
+                touch_boxes, touch_ok = _touched_boxes(
+                    ndo[pno], touched_regions, pno, dpi)
+                boxes = old_boxes + new_boxes + touch_boxes
                 located_all = old_ok and new_ok
+                if not touch_ok:
+                    warnings.append(
+                        "page %d: touched-region masks skipped (rotated page)"
+                        % (pno + 1))
                 outside = diff.copy()
                 inside_any = False
                 for x0, y0, x1, y1 in boxes:
@@ -345,12 +386,23 @@ def _check_pixel_diff(original, edited, applied, dpi_list):
 
 # ── Entry point ─────────────────────────────────────────────────────────
 
-def verify_pdf(original_path, edited_path, applied, dpi=(150, 300)):
+def verify_pdf(original_path, edited_path, applied, dpi=(150, 300),
+               touched_regions=None, extraction_mode="exact",
+               allow_positioning=False):
     """Verify that `edited_path` equals `original_path` except that the
     text replacements in `applied` ({old: new}) were rendered.
 
     `applied` must contain only the replacements that were actually
     applied (edit_pdf passes result['applied'] inverted for this).
+
+    touched_regions: editor-declared content-space bands whose pixels may
+        differ (edited lines plus reflow targets) — masked in pixel_diff.
+    extraction_mode: 'exact' (default) — extraction must equal the original
+        with replacements applied; 'words' — for reflowed edits, the word
+        multiset must match (order may change across line breaks, but no
+        word may be lost or corrupted).
+    allow_positioning: accept changed Tm/Td/TD/T* operands in stream_diff
+        (the editor's declared run shifts), still counting them.
     """
     applied = {o: n for o, n in (applied or {}).items() if o != n}
     report = VerificationReport()
@@ -363,9 +415,12 @@ def verify_pdf(original_path, edited_path, applied, dpi=(150, 300)):
     report.checks.append(CheckResult("applicability", True, {"targets": len(applied)}))
 
     report.checks.append(_check_structure(original_path, edited_path))
-    report.checks.append(_check_stream_diff(original_path, edited_path))
-    report.checks.append(_check_text_extract(original_path, edited_path, applied))
-    pixel = _check_pixel_diff(original_path, edited_path, applied, dpi)
+    report.checks.append(_check_stream_diff(original_path, edited_path,
+                                            allow_positioning))
+    report.checks.append(_check_text_extract(original_path, edited_path,
+                                             applied, extraction_mode))
+    pixel = _check_pixel_diff(original_path, edited_path, applied, dpi,
+                              touched_regions)
     if isinstance(pixel, tuple):
         report.checks.append(pixel[0])
         report.warnings.extend(pixel[1])

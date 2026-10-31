@@ -49,6 +49,11 @@ class SimpleFontCodec:
     def can_encode(self, text: str):
         return [ch for ch in text if ch not in self.uni2code]
 
+    def iter_codes(self, text: str):
+        """Greedy (num_chars, code) steps; code None where unencodable."""
+        for ch in text:
+            yield 1, self.uni2code.get(ch)
+
 
 class CMapFontCodec:
     """Codes split by CMap codespace ranges (1-4 bytes), via ToUnicode."""
@@ -94,6 +99,23 @@ class CMapFontCodec:
                 missing.append(text[i])
                 i += 1
         return missing
+
+    def iter_codes(self, text: str):
+        """Greedy (num_chars, code) steps; code None where unencodable.
+
+        Multi-character reverse keys (ligature decompositions) yield one
+        step covering the whole sequence with the single ligature code.
+        """
+        i, n = 0, len(text)
+        while i < n:
+            for key in self._by_first.get(text[i], ()):
+                if text.startswith(key, i):
+                    yield len(key), int.from_bytes(self._rev[key], "big")
+                    i += len(key)
+                    break
+            else:
+                yield 1, None
+                i += 1
 
 
 def build_codec(font) -> tuple:

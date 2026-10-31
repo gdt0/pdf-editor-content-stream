@@ -98,8 +98,10 @@ def fragment_tj(src, out, target, mode):
                 else:  # split
                     i = text.index(target)
                     mid = i + len(target) // 2
-                    new_instrs.append(([PdfString(enc(text[:mid]))], operator))
-                    new_instrs.append(([PdfString(enc(text[mid:]))], operator))
+                    new_instrs.append(([PdfString(enc(text[:mid]))],
+                                       pikepdf.Operator("Tj")))
+                    new_instrs.append(([PdfString(enc(text[mid:]))],
+                                       pikepdf.Operator("Tj")))
                 done = True
                 continue
         new_instrs.append((operands, operator))
@@ -172,6 +174,44 @@ def make_simple_font_pdf(path, lines, encoding_name=None, differences=None,
     pdf.close()
 
 
+def _helv_widths():
+    """Helvetica advances (1/1000 em) from MuPDF's built-in AFM metrics."""
+    import fitz
+
+    mfont = fitz.Font("helv")
+    return [mfont.glyph_advance(code) * 1000.0 for code in range(256)]
+
+
+def _text_width_12(text):
+    return sum(_helv_widths()[ord(c)] for c in text) * 12.0 / 1000.0
+
+
+def make_positioned_runs_pdf(path, runs, extra_lines=()):
+    """Hand-crafted doc with absolutely-positioned runs on one line (the
+    LaTeX pattern: font/style changes split a line into separately
+    positioned runs). /Widths provided so measurement uses the standard
+    simple-font path."""
+    pdf = pikepdf.new()
+    page = pdf.add_blank_page(page_size=(612, 792))
+    widths = _helv_widths()
+    fd = Dictionary(
+        Type=Name.Font, Subtype=Name.Type1, BaseFont=Name.Helvetica,
+        Encoding=Name.WinAnsiEncoding, FirstChar=0, LastChar=255,
+        Widths=Array([float(round(w, 1)) for w in widths]),
+    )
+    page.Resources = Dictionary(Font=Dictionary(F1=fd))
+    chunks = []
+    for x, y, text in runs:
+        chunks.append(
+            "BT /F1 12 Tf 1 0 0 1 %.2f %.2f Tm (%s) Tj ET" % (x, y, text)
+        )
+    for y, text in extra_lines:
+        chunks.append("BT /F1 12 Tf 72 %.2f Td (%s) Tj ET" % (y, text))
+    page.Contents = pdf.make_stream("\n".join(chunks).encode("latin-1"))
+    pdf.save(path)
+    pdf.close()
+
+
 def main():
     fixtures = {}
 
@@ -238,6 +278,36 @@ def main():
     )
     fixtures["F7"] = f7
 
+    # F8: two absolutely-positioned runs on one line (the LaTeX pattern).
+    # Widening run1 must shift run2's positioning op by the measured delta.
+    f8 = os.path.join(HERE, "F8_positioned_runs.pdf")
+    run1 = "hello world "
+    x2 = 72.0 + _text_width_12(run1)
+    make_positioned_runs_pdf(
+        f8,
+        [(72.0, 700.0, run1), (x2, 700.0, "tail end")],
+        extra_lines=[(500.0,
+                      "the longest line on this page defines the fit "
+                      "boundary used by edits")],
+    )
+    fixtures["F8"] = f8
+
+    # F9: positioned runs + a continuation line — a widening edit overflows
+    # the fit boundary and trailing words move to the continuation line.
+    f9 = os.path.join(HERE, "F9_reflow.pdf")
+    run1 = "filler alpha beta gamma delta epsilon zeta "
+    x2 = 72.0 + _text_width_12(run1)
+    make_positioned_runs_pdf(
+        f9,
+        [(72.0, 700.0, run1), (x2, 700.0, "eta theta iota end")],
+        extra_lines=[
+            (670.0, "second line here"),
+            (500.0, "a decoy wide line that sets the page fit boundary "
+                    "for the reflow test"),
+        ],
+    )
+    fixtures["F9"] = f9
+
     manifest = {
         "_comment": "Golden corpus manifest. mode=ok entries have golden "
                     "verification reports in goldens/<name>.json.",
@@ -256,7 +326,7 @@ def main():
              "expect": {"mode": "ok"}},
             {"name": "f3_crossop", "file": "F3_cross_operator.pdf",
              "replacements": {"SANKET DAWAR": "SACHIN KUMAR"},
-             "expect": {"mode": "error", "message_contains": "not found"}},
+             "expect": {"mode": "ok"}},
             {"name": "f4_multifont", "file": "F4_multifont.pdf",
              "replacements": {"REPORT": "DOSSIER", "Draft": "FINAL"},
              "expect": {"mode": "ok"}},
@@ -272,6 +342,12 @@ def main():
             {"name": "f7_subset", "file": "F7_limited_tounicode.pdf",
              "replacements": {"SANKET": "SACHIN"},
              "expect": {"mode": "error", "message_contains": "missing"}},
+            {"name": "f8_shift", "file": "F8_positioned_runs.pdf",
+             "replacements": {"world": "wonderful"},
+             "expect": {"mode": "ok"}},
+            {"name": "f9_reflow", "file": "F9_reflow.pdf",
+             "replacements": {"alpha": "alpha-much-longer"},
+             "expect": {"mode": "ok"}},
         ],
     }
     with open(os.path.join(HERE, "manifest.json"), "w", encoding="utf-8") as fh:

@@ -62,15 +62,71 @@ def test_perchar_tj_array(corpus_file, tmp_path):
     assert result["replacements_made"] == 1
 
 
-def test_cross_operator_not_found(corpus_file, tmp_path):
-    """Known Phase 3 limitation: text split across two Tj operators."""
+def test_cross_operator_replaced(corpus_file, tmp_path):
+    """Phase 3: the token model matches across operator boundaries."""
+    out = tmp_path / "out.pdf"
+    result = edit_pdf(
+        corpus_file("F3_cross_operator.pdf"), str(out),
+        {"SANKET DAWAR": "SACHIN KUMAR"},
+    )
+    text = _text(out)
+    assert "SACHIN KUMAR" in text
+    assert result["replacements_made"] == 1
+
+
+def test_positioned_runs_shift(corpus_file, tmp_path):
+    """Widening run1 of a positioned-run line shifts run2's anchor by the
+    measured delta; rendering stays pixel-exact outside the line."""
+    import fitz
+
+    out = tmp_path / "out.pdf"
+    result = edit_pdf(
+        corpus_file("F8_positioned_runs.pdf"), str(out),
+        {"world": "wonderful"}, verify=True,
+    )
+    assert result["verification"]["ok"]
+    assert result["fit_actions"][0]["shifted_runs"] == 1
+
+    def tail_x(path):
+        doc = fitz.open(path)
+        words = doc[0].get_text("words")
+        doc.close()
+        return min(w[0] for w in words if w[4] == "tail")
+
+    assert tail_x(str(out)) > tail_x(corpus_file("F8_positioned_runs.pdf"))
+
+
+def test_reflow_moves_words_to_continuation(corpus_file, tmp_path):
+    out = tmp_path / "out.pdf"
+    result = edit_pdf(
+        corpus_file("F9_reflow.pdf"), str(out),
+        {"alpha": "alpha-much-longer"}, verify=True,
+    )
+    assert result["reflowed"] is True
+    assert result["verification"]["ok"]
+    text = _text(out)
+    assert "alpha-much-longer" in text
+    assert "iota end second line here" in text
+
+
+def test_fit_refuse_policy_rejects_width_change(corpus_file, tmp_path):
     out = tmp_path / "out.pdf"
     with pytest.raises(ValueError) as exc:
         edit_pdf(
-            corpus_file("F3_cross_operator.pdf"), str(out),
-            {"SANKET DAWAR": "SACHIN KUMAR"},
+            corpus_file("F8_positioned_runs.pdf"), str(out),
+            {"world": "wonderful"}, fit="refuse",
         )
-    assert "not found" in str(exc.value)
+    assert "DOES_NOT_FIT" in str(exc.value)
+
+
+def test_fit_shift_policy_rejects_overflow(corpus_file, tmp_path):
+    out = tmp_path / "out.pdf"
+    with pytest.raises(ValueError) as exc:
+        edit_pdf(
+            corpus_file("F9_reflow.pdf"), str(out),
+            {"alpha": "alpha-much-longer"}, fit="shift",
+        )
+    assert "DOES_NOT_FIT" in str(exc.value)
 
 
 def test_multifont_both_fonts(corpus_file, tmp_path):
@@ -144,10 +200,10 @@ def test_not_found_only_is_valueerror(corpus_file, tmp_path):
     out = tmp_path / "out.pdf"
     with pytest.raises(ValueError) as exc:
         edit_pdf(
-            corpus_file("F3_cross_operator.pdf"), str(out),
-            {"SANKET DAWAR": "SACHIN KUMAR"},
+            corpus_file("F1_basic_tounicode.pdf"), str(out),
+            {"ZEBRA": "HORSE"},
         )
-    assert "SANKET" in str(exc.value)
+    assert "ZEBRA" in str(exc.value)
 
 
 def test_write_back_survives_roundtrip(corpus_file, tmp_path):
