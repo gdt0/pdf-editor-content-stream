@@ -3,3 +3,4 @@ __pycache__/
 .pytest_cache/
 uploads/
 outputs/
+tmp_v7.pdf
