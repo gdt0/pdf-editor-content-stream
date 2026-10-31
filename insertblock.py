@@ -126,6 +126,8 @@ def _route_streams(sc, cut_y, shift, move_threshold, dy2, page_errors):
     ctm = (1.0, 0.0, 0.0, 1.0, 0.0, 0.0)
     stack = []
     last_text_y = None
+    prefix_end = 0   # everything before the first positioned op = page
+    prefix_done = False  # furniture (base transform, background, clip)
     for idx, ins in enumerate(sc.instructions):
         operands, operator = ins.operands, ins.operator
         op = str(operator)
@@ -158,6 +160,9 @@ def _route_streams(sc, cut_y, shift, move_threshold, dy2, page_errors):
             y = last_text_y
         if y is not None:
             last_text_y = y
+            if not prefix_done:
+                prefix_end = idx
+                prefix_done = True
 
         if y is None or y >= cut_y - 0.5:
             routes.append((idx, "1", 0.0))
@@ -212,14 +217,16 @@ def _route_streams(sc, cut_y, shift, move_threshold, dy2, page_errors):
         for idx, dy in movable:
             t0 = next((t for t in tokens if t.anchor_idx == idx), None)
             if t0 is not None:
-                errs.append((idx, dy - (t0.y - orig_anchor_y[idx])))
-        if not errs or all(abs(e) < 0.5 for _i, e in errs):
+                errs.append((idx, round(dy, 2), round(t0.y - orig_anchor_y[idx], 2)))
+        print("   CALIB iter: k=%s applied[ase-like]=%s errs[:3]=%s n_movable=%d"
+              % (round(k, 4) if k else k,
+                 round(applied.get(movable[0][0], 0), 2) if movable else None,
+                 errs[:3], len(movable)))
+        if not errs or all(abs(e[1] - e[2]) < 0.5 for e in errs):
             converged = True
             break
-        idx0, _e0 = errs[0]
-        act0 = orig_anchor_y[idx0] + (orig_raw.get(idx0, 0.0) + applied[idx0]) * 0.0
-        # k from the measured movement of ANY moved anchor:
-        idx_m, _dy_m = errs[0]
+        # k from the measured movement of the first moved anchor:
+        idx_m, _dy_m, _act_m = errs[0]
         t_m = next(t for t in tokens if t.anchor_idx == idx_m)
         moved = t_m.y - orig_anchor_y[idx_m]
         if applied[idx_m]:
@@ -227,45 +234,57 @@ def _route_streams(sc, cut_y, shift, move_threshold, dy2, page_errors):
     if not converged:
         raise RuntimeError("insertion shifts did not converge")
 
-    _YPOS = {"Tm": 5, "Td": 1, "TD": 1, "re": 1, "m": 1, "l": 1}
-    for idx, dest, dy_raw in routes:
-        if not dy_raw:
-            continue
-        ins = sc.instructions[idx]
-        operands, operator = ins.operands, ins.operator
-        ypos = _YPOS.get(str(operator))
-        if ypos is not None and len(operands) > ypos:
-            new_operands = list(operands)
-            new_operands[ypos] = float(operands[ypos]) + dy_raw
-            sc.instructions[idx] = pikepdf.ContentStreamInstruction(
-                new_operands, operator)
-    sc.model.changed = True
+    # NOTE: the calibration loop above has already applied every raw delta
+    # and verified convergence through the model — do NOT re-apply intents
+    # here (the stale tail that did so produced quarter-applied shifts).
 
-    page1, page2 = [], []
+    # page-2 prefix: STATE ops only (base transform, color/alpha) — the
+    # document's own geometry (background, section rules drawn before any
+    # text) belongs to page 1. q/Q re-balanced after dropping geometry.
+    _GEOMETRY_OPS = ("re", "m", "l", "W", "n", "W*", "f*", "f",
+                     "BT", "ET", "Tf", "TJ", "Tj")
+    prefix = []
+    qb = 0
+    for ins in sc.instructions[:prefix_end]:
+        op = str(ins.operator)
+        if op in _GEOMETRY_OPS:
+            break
+        prefix.append(ins)
+        if op == "q":
+            qb += 1
+        elif op == "Q":
+            qb -= 1
+    while qb > 0:
+        prefix.append(pikepdf.ContentStreamInstruction(
+            [], pikepdf.Operator("Q")))
+        qb -= 1
+    while qb < 0:
+        prefix.insert(0, pikepdf.ContentStreamInstruction(
+            [], pikepdf.Operator("q")))
+        qb += 1
+
+    # partition the positioned part; per-page q/Q rebalance for the routed
+    # ops only (the prefixes are balanced by construction)
+    page1 = list(sc.instructions[:prefix_end])
+    page2 = list(prefix)
     balance = {"1": 0, "2": 0}
-    for (idx, dest, _dy), ins in zip(routes, sc.instructions):
+    for (idx, dest, _dy), ins in zip(routes[prefix_end:],
+                                     sc.instructions[prefix_end:]):
         (page1 if dest == "1" else page2).append(ins)
         op = str(ins.operator)
         if op == "q":
             balance[dest] += 1
         elif op == "Q":
             balance[dest] -= 1
-    while balance["1"] < 0:
-        page1.insert(0, pikepdf.ContentStreamInstruction(
-            [], pikepdf.Operator("q")))
-        balance["1"] += 1
-    while balance["1"] > 0:
-        page1.append(pikepdf.ContentStreamInstruction(
-            [], pikepdf.Operator("Q")))
-        balance["1"] -= 1
-    while balance["2"] < 0:
-        page2.insert(0, pikepdf.ContentStreamInstruction(
-            [], pikepdf.Operator("q")))
-        balance["2"] += 1
-    while balance["2"] > 0:
-        page2.append(pikepdf.ContentStreamInstruction(
-            [], pikepdf.Operator("Q")))
-        balance["2"] -= 1
+    for page, key in ((page1, "1"), (page2, "2")):
+        while balance[key] < 0:
+            page.insert(0, pikepdf.ContentStreamInstruction(
+                [], pikepdf.Operator("q")))
+            balance[key] += 1
+        while balance[key] > 0:
+            page.append(pikepdf.ContentStreamInstruction(
+                [], pikepdf.Operator("Q")))
+            balance[key] -= 1
     return page1, page2, ctm
 
 

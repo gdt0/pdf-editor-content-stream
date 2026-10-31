@@ -1,6 +1,40 @@
 # PDF Content Stream Editor
 
-Edit text in PDFs with **zero format change** — edits raw PDF content stream operators (Tj/TJ) directly, never redraws anything. Ships with a **verification harness** that proves every edit changed only what it claimed to change.
+Edit text in PDFs with **zero format change** — edits raw PDF content stream operators (Tj/TJ) directly, never redraws anything.
+
+## Philosophy: tools, not guarantees
+
+This is a **library for PDF editing, not a layout engine**. We provide
+primitives and diagnostics; **you decide what to do with them**.
+
+- We do **not** promise an edit won't cause overlaps, reflow artifacts, or
+  layout breakage — PDFs are final-form drawing programs and real documents
+  use coordinate transforms (flips, scales) this library does not hide.
+- We **do** promise honest behavior: no silent data loss (missing glyphs are
+  reported, never dropped), structured machine-readable diagnostics for
+  everything, and refusal only where the alternative is corruption.
+- When an edit *does* break something, the toolkit gives you the primitives
+  to **detect and fix it yourself**:
+  - `find_overlaps(path)` — text collisions after an edit
+  - `shift_region(...)` — move positioned runs by a delta (the fix for
+    overprints)
+  - `inspect_pdf(path)` — geometry, coordinate space, fonts, line map
+  - `verify_pdf(...)` — render/text/structure report (a tool, not a gate)
+  - `insert_experience_block(...)` — formatted block insertion (role title,
+    dates, bullets) with measured layout, section keep-together, page
+    overflow, and embedded fallback fonts for glyphs the subsets lack
+  - after any edit, chain the tools: `find_overlaps` → `shift_region` →
+    `find_overlaps` again — detect, fix, re-detect
+
+Worked example (real resume, xetex 0.75-scaled flipped space): inserting a
+new role left the old role overprinted; `find_overlaps` reported 30
+collisions; `shift_region(text_any=[...], dy=-94.63)` moved the old block
+down; `find_overlaps` then reported 0, and the section that no longer fit
+had been moved to page 2.
+
+Fit policies (`fit=refuse|shift|reflow`) exist so you can pick how
+aggressive an edit should be per call — including "just do it and let me
+inspect".
 
 ## How it works
 
