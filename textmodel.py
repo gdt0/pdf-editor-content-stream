@@ -63,6 +63,8 @@ class TextToken:
     anchor_op: str  # 'Tm' | 'Td' | 'TD' | 'T*'
     anchor_x_pos: int  # operand index holding the x translation
     ctm_a: float = 1.0
+    anchor_k_x: float = 1.0  # divisor: user-space delta -> anchor operand
+    anchor_k_y: float = 1.0
 
     @property
     def end(self):
@@ -109,6 +111,8 @@ def _scan_stream(instructions, stream_id, codecs, widths):
     anchor_idx = -1
     anchor_op = None
     anchor_x_pos = 0
+    anchor_k_x = 1.0
+    anchor_k_y = 1.0
 
     for idx, instruction in enumerate(instructions):
         operands, operator = instruction.operands, instruction.operator
@@ -145,16 +149,25 @@ def _scan_stream(instructions, stream_id, codecs, widths):
                 in_text = True
             if op == "Tm" and len(operands) >= 6:
                 tlm = tuple(float(v) for v in operands[:6])
+                # Tm REPLACES the line matrix: translation is in text space,
+                # transformed only by the CTM
+                anchor_k_x, anchor_k_y = ctm[0], ctm[3]
                 anchor_x_pos = 4
             elif op in ("Td", "TD") and len(operands) >= 2:
                 if op == "TD":
                     leading = -float(operands[1])
+                # Td composes THROUGH the previous line matrix: the operand
+                # delta passes by the old matrix's a/d factors
+                anchor_k_x = tlm[0] * ctm[0]
+                anchor_k_y = tlm[3] * ctm[3]
                 tlm = _mul(
                     (1.0, 0.0, 0.0, 1.0, float(operands[0]), float(operands[1])),
                     tlm,
                 )
                 anchor_x_pos = 0
             elif op == "T*":
+                anchor_k_x = tlm[0] * ctm[0]
+                anchor_k_y = tlm[3] * ctm[3]
                 tlm = _mul((1.0, 0.0, 0.0, 1.0, 0.0, -leading), tlm)
                 anchor_x_pos = None
             anchor_idx, anchor_op = idx, op
@@ -200,7 +213,7 @@ def _scan_stream(instructions, stream_id, codecs, widths):
                 y=y, font_key=font_key, size=size,
                 anchor_idx=anchor_idx, anchor_op=anchor_op,
                 anchor_x_pos=(anchor_x_pos if anchor_x_pos is not None else -1),
-                ctm_a=ctm[0],
+                ctm_a=ctm[0], anchor_k_x=anchor_k_x, anchor_k_y=anchor_k_y,
             ))
             if w_units is not None:
                 advance_user += w_units * ctm[0]
@@ -488,7 +501,8 @@ def splice_multi(instructions, smodel, tokens, line, matches, new, codecs):
 
 
 def shift_anchors(instructions, smodel, anchor_ids, delta_user, tokens):
-    """Move positioned runs right by delta (text-space corrected by CTM)."""
+    """Move positioned runs right by delta (user-space delta converted to
+    the anchor operand's space: text-line matrix, then CTM)."""
     smodel.changed = True
     for idx in anchor_ids:
         tok = next(t for t in tokens if t.anchor_idx == idx)
@@ -496,7 +510,8 @@ def shift_anchors(instructions, smodel, anchor_ids, delta_user, tokens):
         operands, operator = ins.operands, ins.operator
         new_operands = list(operands)
         pos = tok.anchor_x_pos
-        new_operands[pos] = float(operands[pos]) + delta_user / (tok.ctm_a or 1.0)
+        k = tok.anchor_k_x or 1.0
+        new_operands[pos] = float(operands[pos]) + delta_user / k
         instructions[idx] = pikepdf.ContentStreamInstruction(new_operands, operator)
 
 

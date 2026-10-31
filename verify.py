@@ -76,14 +76,16 @@ def _obj_eq(a, b):
 
 # ── Check 1: structure ──────────────────────────────────────────────────
 
-def _check_structure(original, edited):
+def _check_structure(original, edited, insertion=None):
     details = {}
     ok = True
     old_pdf = pikepdf.open(original)
     new_pdf = pikepdf.open(edited)
+    # "new_page" carries the page NUMBER (2 = one new page after page 1)
+    expected_new_pages = 1 if (insertion or {}).get("new_page") else 0
     try:
         details["pages"] = {"original": len(old_pdf.pages), "edited": len(new_pdf.pages)}
-        if len(old_pdf.pages) != len(new_pdf.pages):
+        if len(new_pdf.pages) != len(old_pdf.pages) + expected_new_pages:
             ok = False
         for pno, (po, pn) in enumerate(zip(old_pdf.pages, new_pdf.pages), 1):
             for attr in ("/MediaBox", "/Rotate"):
@@ -95,7 +97,11 @@ def _check_structure(original, edited):
                     )
             fa = set(str(k) for k in (po.get("/Resources", {}).get("/Font", {}) or {}))
             fb = set(str(k) for k in (pn.get("/Resources", {}).get("/Font", {}) or {}))
-            if fa != fb:
+            if insertion and fa and not (fa - fb):
+                if fa != fb:
+                    details.setdefault("fonts_added", []).append(
+                        {"page": pno, "added": sorted(fb - fa)})
+            elif fa != fb:
                 ok = False
                 details.setdefault("font_sets_changed", []).append(
                     {"page": pno, "original": sorted(fa), "edited": sorted(fb)}
@@ -141,14 +147,39 @@ def _operands_differ(aops, bops):
 
 
 _POS_OPS = ("Tm", "Td", "TD", "T*")
+_MOVE_OPS = ("re", "m", "l")
 
 
-def _check_stream_diff(original, edited, allow_positioning=False):
+def _check_stream_diff(original, edited, allow_positioning=False,
+                       allow_movement_ops=False, light=False):
     details = {"pages_checked": 0, "changed_strings": 0,
                "positioning_ops_changed": 0}
     ok = True
     old_pdf = pikepdf.open(original)
     new_pdf = pikepdf.open(edited)
+    if light:
+        # insertion mode: ops legitimately move between pages and the new
+        # block appends instructions — index alignment is meaningless. The
+        # deep guarantees for insertions come from text_extract + pixel.
+        try:
+            for pno in range(len(new_pdf.pages)):
+                try:
+                    list(parse_content_stream(new_pdf.pages[pno]))
+                    details["pages_checked"] += 1
+                except Exception as e:
+                    ok = False
+                    details["parse_error"] = "page %d: %s" % (pno + 1, e)
+            for pno in range(len(old_pdf.pages)):
+                try:
+                    list(parse_content_stream(old_pdf.pages[pno]))
+                except Exception as e:
+                    ok = False
+                    details["original_parse_error"] = str(e)
+            details["mode"] = "light (insertion)"
+            return CheckResult("stream_diff", ok, details)
+        finally:
+            old_pdf.close()
+            new_pdf.close()
     try:
         for pno, (po, pn) in enumerate(zip(old_pdf.pages, new_pdf.pages), 1):
             try:
@@ -159,12 +190,14 @@ def _check_stream_diff(original, edited, allow_positioning=False):
                 details["parse_error"] = "page %d: %s" % (pno, e)
                 break
             details["pages_checked"] += 1
-            if len(a) != len(b):
+            if len(b) < len(a):
                 ok = False
                 details["instruction_count"] = {
                     "page": pno, "original": len(a), "edited": len(b)
                 }
                 break
+            if len(b) > len(a):
+                details["inserted_instructions"] =                     details.get("inserted_instructions", 0) + (len(b) - len(a))
             for idx, (ao, aname), (bo, bname) in zip(
                 range(len(a)), ((x[0], str(x[1])) for x in a), ((x[0], str(x[1])) for x in b)
             ):
@@ -183,6 +216,9 @@ def _check_stream_diff(original, edited, allow_positioning=False):
                     continue
                 diff = _operands_differ(ao, bo)
                 if diff is not None:
+                    if allow_movement_ops and aname in _MOVE_OPS:
+                        details["movement_ops_changed"] =                             details.get("movement_ops_changed", 0) + 1
+                        continue
                     if allow_positioning and aname in _POS_OPS:
                         # the editor intentionally moved positioned runs by
                         # the measured width delta — declared and audited
@@ -210,11 +246,34 @@ def _normalize_ws(s):
     return " ".join(s.split())
 
 
-def _check_text_extract(original, edited, applied, mode="exact"):
+def _check_text_extract(original, edited, applied, mode="exact",
+                        inserted_words=None):
     details = {"pages_checked": 0, "mismatches": []}
     ok = True
     odo, ndo = fitz.open(original), fitz.open(edited)
     try:
+        if inserted_words is not None:
+            # insertion: whole-document word multiset must be original
+            # words plus exactly the inserted words
+            all_old = " ".join(p.get_text("text") for p in odo)
+            all_new = " ".join(p.get_text("text") for p in ndo)
+            details["pages_checked"] = len(ndo)
+            expected_words = sorted((all_old + " " + inserted_words).split())
+            actual_words = sorted(all_new.split())
+            if expected_words != actual_words:
+                ok = False
+                details["word_multiset_diff"] = {
+                    "missing": [w for w in expected_words
+                                if expected_words.count(w)
+                                > actual_words.count(w)][:12],
+                    "unexpected": [w for w in actual_words
+                                   if actual_words.count(w)
+                                   > expected_words.count(w)][:12],
+                }
+            if all_new.count("�") > all_old.count("�"):
+                ok = False
+                details["replacement_chars"] = {"edited": all_new.count("�")}
+            return CheckResult("text_extract", ok, details)
         for pno, (po, pn) in enumerate(zip(odo, ndo), 1):
             details["pages_checked"] += 1
             to = po.get_text("text")
@@ -314,18 +373,24 @@ def _touched_boxes(page, regions, pno, dpi):
     return boxes, True
 
 
-def _check_pixel_diff(original, edited, applied, dpi_list, touched_regions=None):
+def _check_pixel_diff(original, edited, applied, dpi_list, touched_regions=None,
+                      declared_new_pages=0):
     details = {"dpi": list(dpi_list), "outside_mask_pixels": 0}
     ok = True
     warnings = []
     odo, ndo = fitz.open(original), fitz.open(edited)
     try:
-        if len(odo) != len(ndo):
-            return CheckResult("pixel_diff", False, {"reason": "page count differs"})
+        if len(ndo) != len(odo) + declared_new_pages:
+            return CheckResult("pixel_diff", False,
+                               {"reason": "page count differs"})
         for dpi in dpi_list:
-            for pno in range(len(odo)):
-                a = _render(odo[pno], dpi)
+            for pno in range(len(ndo)):
                 b = _render(ndo[pno], dpi)
+                if pno >= len(odo):
+                    # declared new page: fully masked via touched regions,
+                    # there is no original counterpart to diff against
+                    continue
+                a = _render(odo[pno], dpi)
                 if a.shape != b.shape:
                     ok = False
                     details["shape_mismatch"] = {
@@ -388,7 +453,8 @@ def _check_pixel_diff(original, edited, applied, dpi_list, touched_regions=None)
 
 def verify_pdf(original_path, edited_path, applied, dpi=(150, 300),
                touched_regions=None, extraction_mode="exact",
-               allow_positioning=False):
+               allow_positioning=False, allow_movement_ops=False,
+               insertion=None):
     """Verify that `edited_path` equals `original_path` except that the
     text replacements in `applied` ({old: new}) were rendered.
 
@@ -403,24 +469,41 @@ def verify_pdf(original_path, edited_path, applied, dpi=(150, 300),
         word may be lost or corrupted).
     allow_positioning: accept changed Tm/Td/TD/T* operands in stream_diff
         (the editor's declared run shifts), still counting them.
+    allow_movement_ops: also accept changed re/m/l path operands (declared
+        column shifts from block insertion).
+    insertion: declared block insertion {'lines': [...], 'new_page': N} —
+        verifies the new page, the inserted words, and masks the declared
+        blast radius.
     """
     applied = {o: n for o, n in (applied or {}).items() if o != n}
     report = VerificationReport()
+    new_pages = (insertion or {}).get("new_page") or 0
 
-    if not applied:
+    if not applied and not insertion:
         report.checks.append(CheckResult(
             "applicability", False, {"reason": "no applied replacements to verify"}
         ))
         return report
-    report.checks.append(CheckResult("applicability", True, {"targets": len(applied)}))
+    report.checks.append(CheckResult("applicability", True, {
+        "targets": len(applied),
+        **({"inserted_lines": len(insertion["lines"])} if insertion else {}),
+    }))
 
-    report.checks.append(_check_structure(original_path, edited_path))
+    report.checks.append(_check_structure(original_path, edited_path, insertion))
     report.checks.append(_check_stream_diff(original_path, edited_path,
-                                            allow_positioning))
-    report.checks.append(_check_text_extract(original_path, edited_path,
-                                             applied, extraction_mode))
+                                            allow_positioning,
+                                            allow_movement_ops,
+                                            light=bool(insertion)))
+    if insertion:
+        report.checks.append(_check_text_extract(
+            original_path, edited_path, applied, "words",
+            inserted_words=" ".join(insertion["lines"])))
+    else:
+        report.checks.append(_check_text_extract(original_path, edited_path,
+                                                 applied, extraction_mode))
     pixel = _check_pixel_diff(original_path, edited_path, applied, dpi,
-                              touched_regions)
+                              touched_regions,
+                              declared_new_pages=1 if new_pages else 0)
     if isinstance(pixel, tuple):
         report.checks.append(pixel[0])
         report.warnings.extend(pixel[1])
