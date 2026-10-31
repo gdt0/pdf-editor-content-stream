@@ -3,11 +3,12 @@ import os
 import uuid
 import shutil
 import json
-from fastapi import FastAPI, UploadFile, File, HTTPException, Form
+from fastapi import FastAPI, UploadFile, File, HTTPException, Form, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pdf_editor import edit_pdf
+from verify import VerificationError
 
 app = FastAPI(title="PDF Content Stream Editor")
 
@@ -18,6 +19,8 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+MAX_UPLOAD_BYTES = 25 * 1024 * 1024
 
 UPLOAD_DIR = os.path.join(os.path.dirname(__file__), "uploads")
 OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "outputs")
@@ -41,10 +44,21 @@ async def health():
 
 @app.post("/api/edit")
 async def edit_pdf_endpoint(
+    request: Request,
     file: UploadFile = File(...),
     replacements: str = Form("{}"),
 ):
-    """Upload PDF + JSON replacements → edited PDF."""
+    """Upload PDF + JSON replacements -> edited PDF.
+
+    Query params:
+        verify=0     skip verification
+        verify=1     verify, report in X-Verification header
+        verify=json  verify, return the JSON report instead of the PDF
+    """
+    verify_mode = request.query_params.get("verify", "json")
+    if verify_mode not in ("0", "1", "json"):
+        raise HTTPException(400, "verify must be 0, 1, or json")
+
     if not file.filename or not file.filename.lower().endswith(".pdf"):
         raise HTTPException(400, "Only PDF files are accepted")
 
@@ -53,31 +67,60 @@ async def edit_pdf_endpoint(
     except json.JSONDecodeError:
         raise HTTPException(400, "Invalid JSON in replacements")
 
-    if not reps:
+    if not isinstance(reps, dict) or not reps:
         raise HTTPException(400, "No replacements provided")
 
     file_id = str(uuid.uuid4())
     pdf_path = os.path.join(UPLOAD_DIR, f"{file_id}.pdf")
+    size = 0
     with open(pdf_path, "wb") as f:
-        shutil.copyfileobj(file.file, f)
+        while True:
+            chunk = file.file.read(1024 * 1024)
+            if not chunk:
+                break
+            size += len(chunk)
+            if size > MAX_UPLOAD_BYTES:
+                f.close()
+                os.remove(pdf_path)
+                raise HTTPException(413, "PDF exceeds 25 MB upload limit")
+            f.write(chunk)
 
     try:
         out_id = uuid.uuid4().hex[:8]
         out_path = os.path.join(OUTPUT_DIR, f"edited_{out_id}.pdf")
-        result = edit_pdf(pdf_path, out_path, reps)
-        return FileResponse(
-            out_path,
-            media_type="application/pdf",
-            filename="edited.pdf",
-            headers={"X-Replacements-Made": str(result["replacements_made"])},
+        result = edit_pdf(
+            pdf_path, out_path, reps, verify=(verify_mode != "0"),
         )
     except ValueError as e:
         raise HTTPException(400, str(e))
+    except VerificationError as e:
+        if os.path.exists(out_path):
+            os.remove(out_path)  # never serve output the harness rejected
+        raise HTTPException(422, detail={
+            "error": "verification failed",
+            "report": e.report.to_dict(),
+        })
     except Exception as e:
+        if os.path.exists(out_path):
+            os.remove(out_path)
         raise HTTPException(500, f"Edit failed: {str(e)}")
     finally:
         if os.path.exists(pdf_path):
             os.remove(pdf_path)
+
+    headers = {
+        "X-Replacements-Made": str(result["replacements_made"]),
+        "X-Verification": "pass",
+        "X-Missing-Glyphs": str(len(result.get("missing_glyphs", []))),
+    }
+    if verify_mode == "json":
+        return JSONResponse(result["verification"], headers=headers)
+    return FileResponse(
+        out_path,
+        media_type="application/pdf",
+        filename="edited.pdf",
+        headers=headers,
+    )
 
 
 if __name__ == "__main__":
