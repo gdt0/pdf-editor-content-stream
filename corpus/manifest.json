@@ -1,0 +1,108 @@
+{
+  "_comment": "Golden corpus manifest. mode=ok entries have golden verification reports in goldens/<name>.json.",
+  "fixtures": [
+    {
+      "name": "f1_name",
+      "file": "F1_basic_tounicode.pdf",
+      "replacements": {
+        "SANKET\u00a0DAWAR": "SACHIN\u00a0KUMAR"
+      },
+      "expect": {
+        "mode": "ok"
+      }
+    },
+    {
+      "name": "f1_repeat",
+      "file": "F1_basic_tounicode.pdf",
+      "replacements": {
+        "alpha": "beta"
+      },
+      "expect": {
+        "mode": "ok"
+      }
+    },
+    {
+      "name": "f1_delete",
+      "file": "F1_basic_tounicode.pdf",
+      "replacements": {
+        "URGENT:\u00a0": ""
+      },
+      "expect": {
+        "mode": "ok"
+      }
+    },
+    {
+      "name": "f2_perchar",
+      "file": "F2_perchar_tj.pdf",
+      "replacements": {
+        "SANKET\u00a0DAWAR": "SACHIN\u00a0KUMAR"
+      },
+      "expect": {
+        "mode": "ok"
+      }
+    },
+    {
+      "name": "f3_crossop",
+      "file": "F3_cross_operator.pdf",
+      "replacements": {
+        "SANKET\u00a0DAWAR": "SACHIN\u00a0KUMAR"
+      },
+      "expect": {
+        "mode": "error",
+        "message_contains": "not found"
+      }
+    },
+    {
+      "name": "f4_multifont",
+      "file": "F4_multifont.pdf",
+      "replacements": {
+        "REPORT": "DOSSIER",
+        "Draft": "FINAL"
+      },
+      "expect": {
+        "mode": "ok"
+      }
+    },
+    {
+      "name": "f5_differences",
+      "file": "F5_differences.pdf",
+      "replacements": {
+        "\u2018": "\u201c"
+      },
+      "expect": {
+        "mode": "ok"
+      }
+    },
+    {
+      "name": "f6_simple_tounicode",
+      "file": "F6_simple_tounicode.pdf",
+      "replacements": {
+        "pending": "done"
+      },
+      "expect": {
+        "mode": "ok"
+      }
+    },
+    {
+      "name": "f7_limited_ok",
+      "file": "F7_limited_tounicode.pdf",
+      "replacements": {
+        "SANKET": "TANKET"
+      },
+      "expect": {
+        "mode": "ok"
+      }
+    },
+    {
+      "name": "f7_subset",
+      "file": "F7_limited_tounicode.pdf",
+      "replacements": {
+        "SANKET": "SACHIN"
+      },
+      "expect": {
+        "mode": "error",
+        "message_contains": "missing"
+      }
+    }
+  ]
+}
