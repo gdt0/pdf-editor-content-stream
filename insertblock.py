@@ -16,11 +16,12 @@ that nothing OUTSIDE the declared blast radius changed.
 import os
 
 import pikepdf
-from pikepdf import parse_content_stream, unparse_content_stream
+from pikepdf import unparse_content_stream
 
 from fontcodec import build_codec
 from widths import build_widths
-from textmodel import _scan_stream, _cluster_lines, find_in_lines, line_by_y
+from textmodel import (_inv, _mul, _scan_stream, _cluster_lines,
+                       find_in_lines, line_by_y)
 
 TOP_MARGIN_REF = 788.10   # page 1's first baseline (name line)
 BOTTOM_MARGIN = 31.0      # matches this template's ~33pt symmetric margin
@@ -60,9 +61,13 @@ def _is_section_header(tokens, line, header_font):
     return keys == {header_font} and 0 < len(txt) < 40
 
 
-def _measure_layout(tokens, lines, anchor_y):
+def _measure_layout(tokens, lines, anchor_y, title_font):
     """Title→bullet gap, single-line bullet pitch, block gap — all measured
-    from the document's own role blocks."""
+    from the document's own role blocks.
+
+    The next role title below the anchor is any line set in the SAME font
+    as the anchor's title (role titles share one font in a resume) — not a
+    hard-coded resource name."""
     bullet_lines = [ln for ln in lines if 0 < ln.y < anchor_y + 1
                     and _line_text(tokens, ln).lstrip().startswith("\u2022")]
     below_anchor = [ln for ln in lines if ln.y < anchor_y - 0.5]
@@ -77,33 +82,25 @@ def _measure_layout(tokens, lines, anchor_y):
             pitches.append(nxt)
     pitch = pitches[0] if pitches else 18.5
 
-    # block gap: last line before the NEXT italic role title
-    title2 = None
+    # block gap: last line before the NEXT role title — a line set ENTIRELY
+    # in the anchor's title font (membership would also match body lines
+    # that merely contain regular text in that font). No further title ->
+    # the block is the last section and nothing can collide below it.
+    d_block_gap = 20.7
     prev_above = None
     for ln in lines:
         if ln.y >= anchor_y - 0.5:
             continue
         fk = {tokens[k].font_key for k in ln.token_ids}
-        txt = _line_text(tokens, ln)
-        if "NBTEVH" in fk and prev_above is not None:
-            title2 = ln.y
-            d_block_gap = prev_above - title2
+        if fk == {title_font} and prev_above is not None:
+            d_block_gap = prev_above - ln.y
             break
         prev_above = ln.y
-    else:
-        d_block_gap = 20.7
     return d_title_to_bullet, pitch, d_block_gap
 
 
 
-def _actual_of(tokens, idx, orig_y):
-    for t in tokens:
-        if t.op_idx == idx:
-            return t.y - orig_y[idx]
-    return 0.0
-
-
-def _route_streams(sc, cut_y, shift, move_threshold, dy2, page_errors):
+def _route_streams(sc, cut_y, shift, move_threshold, dy2):
     """Partition the main stream into (page1_instrs, page2_instrs).
 
     Transform-aware: the page content may live in a flipped space
@@ -121,6 +118,41 @@ def _route_streams(sc, cut_y, shift, move_threshold, dy2, page_errors):
     for t in tokens:
         op_y.setdefault(t.op_idx, t.y)
         anchor_map.setdefault(t.anchor_idx, t)
+
+    # BT..ET blocks route ATOMICALLY: their state ops (BT/Tf/Tc/...) have
+    # no position of their own, and routing them by the PREVIOUS text's y
+    # strands the block's own BT on page 1 while its Td/Tj move to page 2 —
+    # an orphan show op outside BT that viewers drop (text silently lost).
+    # A block's y is its first positioned op's line; state-only blocks ride
+    # with the next positioned text after them.
+    block_of = {}     # instr idx -> its BT start idx
+    block_y = {}      # BT start idx -> route y of the whole block
+    n_instr = len(sc.instructions)
+    next_anchor_y = [None] * n_instr
+    _ny = None
+    for i in range(n_instr - 1, -1, -1):
+        next_anchor_y[i] = _ny
+        if i in anchor_map:
+            _ny = anchor_map[i].y
+    _bt = None
+    _members = []
+    for i, ins in enumerate(sc.instructions):
+        op = str(ins.operator)
+        if op == "BT" and _bt is None:
+            _bt = i
+            _members = [i]
+            continue
+        if _bt is not None:
+            _members.append(i)
+            if i in anchor_map and _bt not in block_y:
+                block_y[_bt] = anchor_map[i].y
+            if op == "ET":
+                for j in _members:
+                    block_of[j] = _bt
+                if _bt not in block_y:
+                    block_y[_bt] = next_anchor_y[i]
+                _bt = None
+                _members = []
 
     routes = []  # (idx, dest, dy_user) — user-space intent
     ctm = (1.0, 0.0, 0.0, 1.0, 0.0, 0.0)
@@ -151,7 +183,11 @@ def _route_streams(sc, cut_y, shift, move_threshold, dy2, page_errors):
             routes.append((idx, "1", 0.0))
             continue
 
-        if idx in anchor_map:
+        if idx in block_of:
+            # whole block shares one route (see block pre-pass above)
+            b = block_of[idx]
+            y = block_y.get(b, last_text_y)
+        elif idx in anchor_map:
             # a positioning anchor routes by ITS OWN line
             y = anchor_map[idx].y
         elif op in ("re", "m", "l") and len(operands) >= 2:
@@ -191,33 +227,42 @@ def _route_streams(sc, cut_y, shift, move_threshold, dy2, page_errors):
     # deltas through a global +/- factor (the page's flip convention). Apply
     # the intent as a first guess, measure the real per-op movement with the
     # model, then correct once. No sign theory — the model is the oracle.
+    # Vector ops (re/m/l) move through the same raw delta as text anchors.
+    # Lines anchored by T* (or the quote operators) derive their position
+    # from the PREVIOUS positioning op + leading: they ride along with it
+    # and have no raw operand of their own, so they are excluded from the
+    # convergence check (previously they made convergence impossible).
     orig_anchor_y = {t.anchor_idx: t.y for t in tokens}
     orig_raw = {}
-    for idx, _dy in [(i, d) for i, _dest, d in routes if d]:
-        t0 = next((t for t in tokens if t.anchor_idx == idx), None)
-        if t0 is not None:
-            ins = sc.instructions[idx]
-            ypos = {"Tm": 5, "Td": 1, "TD": 1}.get(str(ins.operator))
-            if ypos is not None and len(ins.operands) > ypos:
-                orig_raw[idx] = float(ins.operands[ypos])
-    movable = [(idx, dy) for idx, dest, dy in routes if dy]
+    for idx, _dest, dy in routes:
+        if not dy:
+            continue
+        ins = sc.instructions[idx]
+        ypos = _YPOS.get(str(ins.operator))
+        if ypos is not None and len(ins.operands) > ypos:
+            orig_raw[idx] = float(ins.operands[ypos])
+    movable = [(idx, dy) for idx, dest, dy in routes
+               if dy and idx in orig_raw]
     intent = {idx: dy for idx, dy in movable}
     applied = {idx: 0.0 for idx in orig_raw}
+    err_anchors = {idx for idx, _dy in movable
+                   if any(t.anchor_idx == idx for t in tokens)}
     k = 1.0
-    converged = not movable
+    converged = not intent
     for _ in range(4):
         deltas = {idx: intent[idx] / (k or 1.0) - applied[idx]
-                  for idx in applied}
+                  for idx in intent}
         _apply_raw(deltas)
         for idx, d in deltas.items():
             applied[idx] += d
         tokens = _scan_stream(sc.instructions, sc.sid,
                               sc.codecs, sc.widths)
         errs = []
-        for idx, dy in movable:
+        for idx in err_anchors:
             t0 = next((t for t in tokens if t.anchor_idx == idx), None)
             if t0 is not None:
-                errs.append((idx, round(dy, 2), round(t0.y - orig_anchor_y[idx], 2)))
+                errs.append((idx, round(intent[idx], 2),
+                             round(t0.y - orig_anchor_y[idx], 2)))
         if not errs or all(abs(e[1] - e[2]) < 0.5 for e in errs):
             converged = True
             break
@@ -287,19 +332,16 @@ def _route_streams(sc, cut_y, shift, move_threshold, dy2, page_errors):
     return page1, page2, ctm
 
 
-def _inv(m):
-    a, b, c, d, e, f = m
-    det = a * d - b * c
-    return (d / det, -b / det, -c / det, a / det,
-            (c * f - d * e) / det, (b * e - a * f) / det)
+def _inv_or_refuse(m):
+    """textmodel._inv translated into this module's refusal type."""
+    try:
+        return _inv(m)
+    except ValueError:
+        raise FitError("SINGULAR_MATRIX",
+                       {"matrix": [round(v, 6) for v in m]})
 
 
-def _mul(m1, m2):
-    a1, b1, c1, d1, e1, f1 = m1
-    a2, b2, c2, d2, e2, f2 = m2
-    return (a1 * a2 + b1 * c2, a1 * b2 + b1 * d2,
-            c1 * a2 + d1 * c2, c1 * b2 + d1 * d2,
-            e1 * a2 + f1 * c2 + e2, e1 * b2 + f1 * d2 + f2)
+
 
 
 def _runs_bytes(runs, base_ctm=(1.0, 0.0, 0.0, 1.0, 0.0, 0.0)):
@@ -308,7 +350,7 @@ def _runs_bytes(runs, base_ctm=(1.0, 0.0, 0.0, 1.0, 0.0, 0.0)):
     Each run's Tm is translate(user pos) x base_ctm^-1, so the rendered
     position is the user-space coordinate regardless of the graphics state
     at the append point (flipped xetex pages included)."""
-    inv = _inv(base_ctm)
+    inv = _inv_or_refuse(base_ctm)
     parts = []
     for font_key, size, x, y, text, codec in runs:
         m = _mul((1.0, 0.0, 0.0, 1.0, x, y), inv)
@@ -330,16 +372,42 @@ class FitError(Exception):
         super().__init__(reason)
 
 
-_FALLBACK_TTF = {
-    "regular": r"C:\Windows\Fonts\times.ttf",
-    "bold": r"C:\Windows\Fonts\timesbd.ttf",
-    "italic": r"C:\Windows\Fonts\timesi.ttf",
+# Times-metric-compatible fallback candidates across platforms; the first
+# existing file wins (Liberation Serif matches Times New Roman metrics on
+# Linux, DejaVu Serif is the further fallback).
+_FONT_DIRS = [
+    r"C:\Windows\Fonts",
+    "/usr/share/fonts/truetype/msttcorefonts",
+    "/usr/share/fonts/truetype/liberation",
+    "/usr/share/fonts/truetype/dejavu",
+    "/usr/share/fonts",
+    "/Library/Fonts",
+    "/System/Library/Fonts",
+]
+_FALLBACK_TTF_NAMES = {
+    "regular": ("times.ttf", "Times New Roman.ttf",
+                "LiberationSerif-Regular.ttf", "DejaVuSerif.ttf"),
+    "bold": ("timesbd.ttf", "Times New Roman Bold.ttf",
+             "LiberationSerif-Bold.ttf", "DejaVuSerif-Bold.ttf"),
+    "italic": ("timesi.ttf", "Times New Roman Italic.ttf",
+               "LiberationSerif-Italic.ttf", "DejaVuSerif-Italic.ttf"),
 }
 _FALLBACK_BASE = {
     "regular": "TimesNewRomanPSMT",
     "bold": "TimesNewRomanPS-BoldMT",
     "italic": "TimesNewRomanPS-ItalicMT",
 }
+
+
+def _fallback_ttf_path(style):
+    tried = []
+    for d in _FONT_DIRS:
+        for name in _FALLBACK_TTF_NAMES[style]:
+            path = os.path.join(d, name)
+            if os.path.exists(path):
+                return path
+            tried.append(path)
+    raise FitError("NO_FALLBACK_FONT", {"tried": tried})
 
 
 def _ensure_fallback_font(pdf, page, sc, style):
@@ -351,28 +419,30 @@ def _ensure_fallback_font(pdf, page, sc, style):
         return res_name
     from fontTools.ttLib import TTFont
 
-    path = _FALLBACK_TTF[style]
-    if not os.path.exists(path):
-        raise FitError("NO_FALLBACK_FONT", {"path": path})
+    path = _fallback_ttf_path(style)
+    with open(path, "rb") as fh:
+        data = fh.read()
     tt = TTFont(path)
-    cmap = tt.getBestCmap()
-    hmtx = tt["hmtx"].metrics
-    upm = tt["head"].unitsPerEm
+    try:
+        cmap = tt.getBestCmap()
+        hmtx = tt["hmtx"].metrics
+        upm = tt["head"].unitsPerEm
 
-    widths = []
-    for code in range(256):
-        try:
-            uni = bytes([code]).decode("cp1252")
-        except UnicodeDecodeError:
-            uni = None
-        gname = cmap.get(ord(uni)) if uni else None
-        w = hmtx[gname][0] if gname else 0
-        widths.append(round(w * 1000.0 / upm, 1))
+        widths = []
+        for code in range(256):
+            try:
+                uni = bytes([code]).decode("cp1252")
+            except UnicodeDecodeError:
+                uni = None
+            gname = cmap.get(ord(uni)) if uni else None
+            w = hmtx[gname][0] if gname else 0
+            widths.append(round(w * 1000.0 / upm, 1))
 
-    data = open(path, "rb").read()
-    head = tt["head"]
-    hhea = tt["hhea"]
-    post = tt["post"]
+        head = tt["head"]
+        hhea = tt["hhea"]
+        post = tt["post"]
+    finally:
+        tt.close()
     fd = pikepdf.Dictionary(
         FontName=pikepdf.Name("/" + _FALLBACK_BASE[style]),
         Flags=32,
@@ -397,6 +467,11 @@ def _ensure_fallback_font(pdf, page, sc, style):
     )
     res = _page_resources_of(sc.page)
     font_dict = res.get("/Font")
+    if font_dict is None:
+        # a page with no /Font dict yet: create one instead of crashing on
+        # a None subscript
+        font_dict = pikepdf.Dictionary()
+        res["/Font"] = font_dict
     font_dict[pikepdf.Name("/" + res_name)] = font
     sc.codecs[res_name] = build_codec(font)[0]
     sc.widths[res_name] = build_widths(font)
@@ -423,6 +498,8 @@ def insert_experience_block(input_path, output_path, title, dates, bullets,
     bullets: list of (bold_lead, regular_rest).
     Sections below that would cross the bottom margin move to a new page.
     """
+    if not bullets:
+        raise ValueError("at least one bullet is required")
     if anchor_query is None:
         anchor_query = title  # not useful; callers pass the existing role
     pdf = pikepdf.open(input_path)
@@ -430,7 +507,13 @@ def insert_experience_block(input_path, output_path, title, dates, bullets,
     fonts_skipped = {}
     from pdf_editor import _collect_streams
     streams = _collect_streams(pdf, page_errors, fonts_skipped)
-    sc = streams[0]  # main page stream
+    # page 1's MAIN stream, by identity — not streams[0]: if page 1 failed
+    # to parse, streams[0] would be an XObject or another page's stream and
+    # the block would silently land in the wrong place
+    mains = [s for s in streams if s.page_no == 1 and s.kind == "page"]
+    if not mains:
+        raise FitError("PAGE_UNREADABLE", {"page_errors": page_errors})
+    sc = mains[0]
     tokens, lines = sc.tokens, sc.lines
 
     # locate the anchor role line
@@ -441,14 +524,23 @@ def insert_experience_block(input_path, output_path, title, dates, bullets,
     anchor_y = anchor_line.y
     right_edge = anchor_line.max_x1
 
-    d_tb, pitch, d_gap = _measure_layout(tokens, lines, anchor_y)
+    def _codec_of(font_key):
+        # an exemplar font the codec layer skipped (e.g. Type0 without
+        # ToUnicode) must refuse with a reason, not KeyError mid-insert
+        if font_key not in sc.codecs:
+            raise FitError("FONT_SKIPPED", {
+                "font": font_key,
+                "reason": fonts_skipped.get(font_key, "undecodable"),
+            })
+        return sc.codecs[font_key]
 
-    # exemplars
+    # exemplars (the anchor's own title font measures the whole layout)
     title_toks = [tokens[k] for k in anchor_line.token_ids]
     title_font = title_toks[0].font_key
     title_size = title_toks[0].size
-    title_codec = sc.codecs[title_font]
+    title_codec = _codec_of(title_font)
     title_fw = sc.widths[title_font]
+    d_tb, pitch, d_gap = _measure_layout(tokens, lines, anchor_y, title_font)
 
     bullet_line = None
     for ln in lines:
@@ -464,19 +556,27 @@ def insert_experience_block(input_path, output_path, title, dates, bullets,
     # bold exemplar: the document's heading font (same family used for the
     # bullet lead words); regular: the dominant body font on this line
     header_font = _detect_header_font(tokens, lines, anchor_y)
-    bold_font = header_font or next(
-        t.font_key for t in btoks if t.font_key != bullet_font)
+    if header_font:
+        bold_font = header_font
+    else:
+        alt = [t.font_key for t in btoks if t.font_key != bullet_font]
+        if not alt:
+            raise FitError("NO_BOLD_EXEMPLAR",
+                           {"bullet_font": bullet_font})
+        bold_font = alt[0]
     bold_size = bullet_size
     body_counts = {}
     for t in btoks:
         if t is not bullet_tok and t.font_key != bold_font:
             body_counts[t.font_key] = body_counts.get(t.font_key, 0) + len(t.text)
+    if not body_counts:
+        raise FitError("NO_BODY_EXEMPLAR", {"bullet_font": bullet_font})
     reg_font = max(body_counts, key=body_counts.get)
     reg_size = next(t.size for t in btoks if t.font_key == reg_font)
-    bullet_codec = sc.codecs[bullet_font]
-    bold_codec = sc.codecs[bold_font]
+    bullet_codec = _codec_of(bullet_font)
+    bold_codec = _codec_of(bold_font)
     bold_fw = sc.widths[bold_font]
-    reg_codec = sc.codecs[reg_font]
+    reg_codec = _codec_of(reg_font)
     reg_fw = sc.widths[reg_font]
     title_fw = sc.widths[title_font]
 
@@ -548,12 +648,12 @@ def insert_experience_block(input_path, output_path, title, dates, bullets,
     if ys_above:
         cut_y = (anchor_y + min(ys_above)) / 2.0
     page1_instrs, page2_instrs, ctm_final = _route_streams(
-        sc, cut_y, -H, route_threshold, dy2, page_errors)
+        sc, cut_y, -H, route_threshold, dy2)
 
     # emit the new block at the anchor's slot — runs the subset fonts
     # cannot encode fall back to an embedded Times New Roman resource
     def run_ready(font_key, size, style, text):
-        codec = sc.codecs[font_key]
+        codec = _codec_of(font_key)
         _miss = codec.can_encode(text)
         if _miss:
             # subset lacks glyphs for this run: embed the fallback resource

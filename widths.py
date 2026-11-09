@@ -58,11 +58,21 @@ class FontWidths:
 
 
 def _simple_widths_from_array(font):
-    widths = font.get("/Widths")
-    if widths is None:
+    # malformed numerics degrade to None (unmeasured), never raise: one bad
+    # /Widths entry must not kill the whole edit at build time
+    try:
+        widths = font.get("/Widths")
+        if widths is None:
+            return None
+        first = int(font.get("/FirstChar", 0))
+    except (TypeError, ValueError):
         return None
-    first = int(font.get("/FirstChar", 0))
-    arr = [float(w) if w is not None else None for w in widths]
+    arr = []
+    for w in widths:
+        try:
+            arr.append(float(w) if w is not None else None)
+        except (TypeError, ValueError):
+            arr.append(None)
 
     def lookup(code):
         idx = code - first
@@ -74,26 +84,30 @@ def _simple_widths_from_array(font):
 
 
 def _parse_w_array(wobj):
-    """Parse /W -> {cid: advance} (1/1000 em)."""
+    """Parse /W -> {cid: advance} (1/1000 em). Malformed entries are
+    skipped, not fatal."""
     out = {}
     i = 0
     n = len(wobj)
     while i < n:
-        c = int(wobj[i])
-        if i + 1 < n and isinstance(wobj[i + 1], (list, pikepdf.Array)):
-            for j, w in enumerate(wobj[i + 1]):
-                if w is not None:
-                    out[c + j] = float(w)
-            i += 2
-        elif i + 2 < n:
-            c2 = int(wobj[i + 1])
-            w = float(wobj[i + 2])
-            if c2 - c < 65536:  # bomb guard
-                for cid in range(c, c2 + 1):
-                    out[cid] = w
-            i += 3
-        else:
-            break
+        try:
+            c = int(wobj[i])
+            if i + 1 < n and isinstance(wobj[i + 1], (list, pikepdf.Array)):
+                for j, w in enumerate(wobj[i + 1]):
+                    if w is not None:
+                        out[c + j] = float(w)
+                i += 2
+            elif i + 2 < n:
+                c2 = int(wobj[i + 1])
+                w = float(wobj[i + 2])
+                if c2 - c < 65536:  # bomb guard
+                    for cid in range(c, c2 + 1):
+                        out[cid] = w
+                i += 3
+            else:
+                break
+        except (TypeError, ValueError):
+            i += 1  # skip the unparsable element, keep scanning
     return out
 
 
@@ -111,7 +125,10 @@ def _cid_widths_from_w(font):
         return None
     table = _parse_w_array(wobj)
     # CIDs not covered by /W use the font's default width (spec: 1000)
-    dw = float(cidfont.get("/DW", 1000))
+    try:
+        dw = float(cidfont.get("/DW", 1000))
+    except (TypeError, ValueError):
+        dw = 1000.0
 
     def lookup(code):
         return table.get(code, dw)
@@ -198,10 +215,16 @@ def build_widths(font) -> FontWidths:
         lookups += [_cid_widths_from_w(font), _cid_widths_from_embedded(font)]
     else:
         lookups.append(_simple_widths_from_array(font))
-
-    base14 = _base14_widths(font)
-    if base14 is not None:
-        lookups.append(base14)
+        # base14 metric fallback maps a LATIN character code to a width.
+        # Codes here are font bytes/CIDs, not Unicode: for Symbol and
+        # ZapfDingbats (custom encodings) and for Type0 CIDs the lookup
+        # measured the wrong glyph — gate the fallback to Latin-encoded
+        # simple fonts only.
+        base = str(font.get("/BaseFont", "")).lstrip("/").split("+")[-1]
+        if base not in ("Symbol", "ZapfDingbats"):
+            base14 = _base14_widths(font)
+            if base14 is not None:
+                lookups.append(base14)
 
     def combined(code):
         for lookup in lookups:

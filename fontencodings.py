@@ -123,6 +123,22 @@ _STANDARD_HIGH_MATH = {
     0x8A: "radical", 0x8B: "approxequal", 0x8C: "Delta",
 }
 
+# 0xA1-0xBF: identical in WinAnsi and Standard (Latin-1 upper half; both
+# PDF tables deviate from cp1252 only at 0xAD, overridden below). Shared
+# because the WinAnsi/Standard tables were missing this block entirely —
+# £ © ° « ¿ etc. decoded to '' and their glyphs were falsely refused.
+_LATIN1_MID = {
+    0xA1: "exclamdown", 0xA2: "cent", 0xA3: "sterling", 0xA4: "currency",
+    0xA5: "yen", 0xA6: "brokenbar", 0xA7: "section", 0xA8: "dieresis",
+    0xA9: "copyright", 0xAA: "ordfeminine", 0xAB: "guillemotleft",
+    0xAC: "logicalnot", 0xAE: "registered", 0xAF: "macron",
+    0xB0: "degree", 0xB1: "plusminus", 0xB2: "twosuperior",
+    0xB3: "threesuperior", 0xB4: "acute", 0xB5: "mu", 0xB6: "paragraph",
+    0xB7: "periodcentered", 0xB8: "cedilla", 0xB9: "onesuperior",
+    0xBA: "ordmasculine", 0xBB: "guillemotright", 0xBC: "onequarter",
+    0xBD: "onehalf", 0xBE: "threequarters", 0xBF: "questiondown",
+}
+
 
 def _latin_high(start):
     return {start + i: _AGL[_LATIN_UPPER[i]] for i in range(31)}
@@ -144,6 +160,7 @@ def build_base_encoding(name):
     if name not in ("WinAnsiEncoding", "StandardEncoding", "MacRomanEncoding"):
         return {}
     table = {code: _AGL[n] for code, n in _ascii_names().items()}
+    table.update({code: _AGL[glyph] for code, glyph in _LATIN1_MID.items()})
     if name == "WinAnsiEncoding":
         for code, glyph in _WINANSI_HIGH.items():
             table[code] = _AGL[glyph]

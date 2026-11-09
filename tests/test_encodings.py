@@ -77,3 +77,20 @@ def test_unknown_glyph_name_ignored():
 def test_reverse_first_code_wins():
     _, uni2code = build_simple_encoding("WinAnsiEncoding")
     assert uni2code["A"] == 0x41
+
+
+def test_winansi_and_standard_latin1_mid_block():
+    """0xA1-0xBF must decode in both WinAnsi and Standard (previously the
+    whole block was missing: £ © ° « ¿ decoded to '' and edits touching
+    them were falsely refused as missing glyphs)."""
+    expected = {
+        0xA1: "¡", 0xA3: "£", 0xA9: "©", 0xAB: "«", 0xB0: "°",
+        0xB5: "µ", 0xBF: "¿",
+    }
+    for name in ("WinAnsiEncoding", "StandardEncoding"):
+        table = build_base_encoding(name)
+        for code, ch in expected.items():
+            assert table[code] == ch, "%s 0x%02X" % (name, code)
+    # 0xAD stays the PDF hyphen deviation in both
+    for name in ("WinAnsiEncoding", "StandardEncoding"):
+        assert build_base_encoding(name)[0xAD] == "\u2010"

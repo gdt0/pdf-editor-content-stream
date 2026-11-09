@@ -208,7 +208,12 @@ def _check_stream_diff(original, edited, allow_positioning=False,
                     }
                     break
                 if aname == "INLINE IMAGE":
-                    continue  # inline image payloads round-trip loosely
+                    # inline image payloads round-trip loosely through
+                    # parse/unparse, so they cannot be byte-compared — but
+                    # they are COUNTED, not silently skipped
+                    details["inline_images_skipped"] = \
+                        details.get("inline_images_skipped", 0) + 1
+                    continue
                 if aname in _TEXT_SHOW_OPS:
                     diff = _operands_differ(ao, bo)
                     if diff is not None:
@@ -246,6 +251,20 @@ def _normalize_ws(s):
     return " ".join(s.split())
 
 
+def _apply_replacements(text, applied):
+    """Apply {old: new} in ONE pass (longest key wins at each position).
+
+    Sequential str.replace over pairs corrupts the expectation on
+    chained/overlapping pairs ({"A": "B", "B": "C"} would cascade)."""
+    import re
+
+    keys = sorted((k for k in applied if k), key=len, reverse=True)
+    if not keys:
+        return text
+    rx = re.compile("|".join(re.escape(k) for k in keys))
+    return rx.sub(lambda m: applied[m.group(0)], text)
+
+
 def _check_text_extract(original, edited, applied, mode="exact",
                         inserted_words=None):
     details = {"pages_checked": 0, "mismatches": []}
@@ -278,9 +297,7 @@ def _check_text_extract(original, edited, applied, mode="exact",
             details["pages_checked"] += 1
             to = po.get_text("text")
             tn = pn.get_text("text")
-            expected = to
-            for old, new in applied.items():
-                expected = expected.replace(old, new)
+            expected = _apply_replacements(to, applied)
             if expected != tn:
                 if mode == "words" and sorted(expected.split()) == sorted(tn.split()):
                     # reflowed edit: words moved across lines but none lost
@@ -320,9 +337,9 @@ def _mask_boxes(page, texts, dpi):
 
     Returns (boxes, located_all). Each text's line is masked as a
     full-width horizontal band: a replacement with a different width than
-    the original shifts the remainder of its line, so anything changing
-    outside the edited lines is a failure, but in-line shifts are expected
-    until the Phase 3 fit policy exists. Both the old text (searched in the
+    the original legitimately shifts the remainder of its line (the Phase 3
+    fit policy shifts/reflows same-flow runs), so anything changing OUTSIDE
+    the edited lines is a failure. Both the old text (searched in the
     original) and the new text (searched in the edited file) are masked.
     """
     scale = dpi / 72.0
@@ -369,7 +386,15 @@ def _touched_boxes(page, regions, pno, dpi):
             continue
         y0 = max(0.0, (h - r["y1"]) * scale)
         y1 = min(h * scale, (h - r["y0"]) * scale)
-        boxes.append((0, int(y0), int(page.rect.width * scale), int(y1) + 1))
+        # finite region x-bounds tighten the band; the editor's
+        # full-width declarations (x1 = 10**6) keep the whole width
+        xr0, xr1 = r.get("x0"), r.get("x1")
+        if xr0 is None or xr1 is None or xr1 >= 1e6:
+            bx0, bx1 = 0, int(page.rect.width * scale)
+        else:
+            bx0 = max(0, int(xr0 * scale))
+            bx1 = min(int(page.rect.width * scale), int(xr1 * scale) + 1)
+        boxes.append((bx0, int(y0), bx1, int(y1) + 1))
     return boxes, True
 
 

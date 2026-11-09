@@ -48,6 +48,19 @@ def _mul(m1, m2):
     )
 
 
+def _inv(m):
+    """Inverse of an affine matrix (row-vector convention).
+
+    Raises ValueError on a singular linear part — callers translate that
+    into their own refusal type."""
+    a, b, c, d, e, f = m
+    det = a * d - b * c
+    if abs(det) < 1e-12:
+        raise ValueError("singular matrix: %r" % (m,))
+    return (d / det, -b / det, -c / det, a / det,
+            (c * f - d * e) / det, (b * e - a * f) / det)
+
+
 @dataclass
 class TextToken:
     stream_id: int
@@ -105,7 +118,8 @@ def _scan_stream(instructions, stream_id, codecs, widths):
     leading = 0.0
     font_key = None
     size = 0.0
-    tc = tw = tz = 0.0
+    tc = tw = 0.0
+    tz = 100.0  # PDF default: horizontal scaling percentage (100 = none)
     rise = 0.0
     in_text = False
     anchor_idx = -1
@@ -172,6 +186,25 @@ def _scan_stream(instructions, stream_id, codecs, widths):
                 anchor_x_pos = None
             anchor_idx, anchor_op = idx, op
 
+        if op in ("'", '"') and in_text:
+            # ' = T* then show (the line starts ONE TEXT LINE below the
+            # previous one); " = set Tw/Tc, then act like '. Both were
+            # previously placed on the PREVIOUS line's baseline, corrupting
+            # clustering and matches. The line position derives from the
+            # leading, not from an editable operand of this op, so tokens
+            # anchor here but are not directly shiftable (same treatment
+            # as T*).
+            tlm = _mul((1.0, 0.0, 0.0, 1.0, 0.0, -leading), tlm)
+            anchor_idx, anchor_op = idx, op
+            anchor_x_pos = None
+            anchor_k_x = tlm[0] * ctm[0]
+            anchor_k_y = tlm[3] * ctm[3]
+            if op == '"' and len(operands) >= 2:
+                try:
+                    tw, tc = float(operands[0]), float(operands[1])
+                except (TypeError, ValueError):
+                    pass
+
         if op not in TEXT_OPS or not in_text:
             continue
         codec = codecs.get(font_key)
@@ -182,20 +215,37 @@ def _scan_stream(instructions, stream_id, codecs, widths):
         trm = _mul(trsf, tlm)
         full = _mul(trm, ctm)
         x0, y = full[4], full[5]
+        # text-space -> user-space horizontal scale: Tz, the line matrix's
+        # a, and the CTM's a all scale x advances (previously the Tz and
+        # tlm factors were dropped, skewing token x under Tz or a scaled Tm)
+        user_scale = (tz / 100.0) * tlm[0] * ctm[0]
 
-        strings = []
+        # (elem_idx, raw bytes, kern_seen) per shown string, in TJ array
+        # order: interleaved kern numbers displace subsequent tokens within
+        # the same show op (previously they only adjusted the post-op
+        # advance, so per-token x was wrong on kerned lines)
+        shown = []
         if op == "TJ":
             arr = operands[0] if operands else None
             if isinstance(arr, pikepdf.Array):
+                kern_seen = 0.0  # text-space displacement so far
                 for ei, e in enumerate(arr):
                     if isinstance(e, pikepdf.String):
-                        strings.append((ei, bytes(e)))
+                        shown.append((ei, bytes(e), kern_seen))
+                    else:
+                        try:
+                            kern_seen -= float(e) * size * tz / 100000.0
+                        except (TypeError, ValueError):
+                            pass
+        elif op == '"':
+            if len(operands) >= 3 and isinstance(operands[2], pikepdf.String):
+                shown.append((2, bytes(operands[2]), 0.0))
         else:
             if operands and isinstance(operands[0], pikepdf.String):
-                strings.append((0, bytes(operands[0])))
+                shown.append((0, bytes(operands[0]), 0.0))
 
-        advance_user = 0.0
-        for ei, raw in strings:
+        offset_user = 0.0  # displacement from preceding strings in this op
+        for ei, raw, kern_units in shown:
             text = codec.decode(raw)
             if not text:
                 continue
@@ -203,36 +253,45 @@ def _scan_stream(instructions, stream_id, codecs, widths):
             fw = widths.get(font_key)
             if fw is not None:
                 w_units = fw.text_width(text, codec, size, tc, tw)
+            token_x0 = x0 + offset_user + kern_units * tlm[0] * ctm[0]
             if w_units is None:
                 token_x1 = None  # unmeasurable run
             else:
-                token_x1 = x0 + advance_user + w_units * ctm[0]
+                token_x1 = token_x0 + w_units * user_scale
             tokens.append(TextToken(
                 stream_id=stream_id, op_idx=idx, elem_idx=ei, text=text,
-                x0=(x0 + advance_user if advance_user else x0), x1=token_x1,
+                x0=token_x0, x1=token_x1,
                 y=y, font_key=font_key, size=size,
                 anchor_idx=anchor_idx, anchor_op=anchor_op,
                 anchor_x_pos=(anchor_x_pos if anchor_x_pos is not None else -1),
                 ctm_a=ctm[0], anchor_k_x=anchor_k_x, anchor_k_y=anchor_k_y,
             ))
             if w_units is not None:
-                advance_user += w_units * ctm[0]
+                offset_user += w_units * user_scale
 
-        # advance text position: width of ALL strings incl. numbers (TJ)
+        # advance text position: width of ALL strings incl. numbers (TJ),
+        # scaled by Tz like the kern terms and the per-token offsets —
+        # previously widths advanced unscaled while kerns scaled, which
+        # disagreed under Tz != 100
         total_units = 0.0
         known = True
-        for ei, raw in strings:
+        th = tz / 100.0
+        for _ei, raw, _kern in shown:
             text = codec.decode(raw)
             fw = widths.get(font_key)
             w = fw.text_width(text, codec, size, tc, tw) if fw else None
             if w is None:
                 known = False
                 break
-            total_units += w
+            total_units += w * th
         if op == "TJ" and known and isinstance(operands[0], pikepdf.Array):
             for e in operands[0]:
                 if not isinstance(e, pikepdf.String):
-                    total_units -= float(e) * size * tz / 100000.0
+                    try:
+                        total_units -= float(e) * size / 1000.0 * th
+                    except (TypeError, ValueError):
+                        known = False
+                        break
         if known:
             tlm = _mul((1, 0, 0, 1, total_units, 0), tlm)
 
@@ -314,7 +373,8 @@ def find_in_lines(tokens, lines, query, case_sensitive=True):
                 break
             matches.append(Match(
                 line_idx=li, start_tok=start_tok, start_char=start_char,
-                end_tok=end_tok, end_char=end_char, text=query,
+                end_tok=end_tok, end_char=end_char,
+                text=full[pos:pos + len(needle)],  # actual casing, not query
             ))
             start = pos + len(needle)
     return matches
@@ -339,7 +399,7 @@ def _line_of(tokens, lines, tok_idx):
     return None, None
 
 
-def _chain_after(tokens, line, end_tok, end_char_in_line, gap_tol=GAP_TOL_DEFAULT):
+def _chain_after(tokens, line, end_tok, gap_tol=GAP_TOL_DEFAULT):
     """Same-flow trailing tokens: consecutive-in-x runs after the match.
 
     A run joins the chain only if it starts within gap_tol of the previous
@@ -393,21 +453,30 @@ def plan_multi(tokens, line, matches, old, new, codecs, widths):
             w_old += w
 
     first = tokens[matches[0].start_tok]
-    codec = codecs.get(first.font_key)
-    missing = codec.can_encode(new)
-    if missing:
-        # coverage gate comes FIRST: report the absent glyphs, not a
-        # measurement failure
-        raise FitRefused("UNENCODABLE", {"missing": missing})
-    fw = widths.get(first.font_key)
-    w_new_unit = fw.text_width(new, codec, first.size)
-    if w_new_unit is None:
-        raise FitRefused("UNMEASURED", {"font": first.font_key})
-    delta_user = (w_new_unit * len(matches) - w_old) * first.ctm_a
+    # coverage + width per match, in THAT match's own font: a group spanning
+    # fonts (bold lead + body) previously measured everything with the first
+    # match's font, producing a wrong delta and hiding real unencodability
+    w_new_total = 0.0
+    for m in matches:
+        t0 = tokens[m.start_tok]
+        codec = codecs.get(t0.font_key)
+        fw = widths.get(t0.font_key)
+        if codec is None or fw is None:
+            raise FitRefused("UNMEASURED", {"font": t0.font_key})
+        missing = codec.can_encode(new)
+        if missing:
+            # coverage gate comes FIRST: report the absent glyphs, not a
+            # measurement failure
+            raise FitRefused("UNENCODABLE", {"missing": missing})
+        w_new_unit = fw.text_width(new, codec, t0.size)
+        if w_new_unit is None:
+            raise FitRefused("UNMEASURED", {"font": t0.font_key})
+        w_new_total += w_new_unit * t0.ctm_a
+    delta_user = w_new_total - w_old
 
     # trailing same-flow chain after the LAST match
     last = matches[-1]
-    chain = _chain_after(tokens, line, last.end_tok, last.end_char)
+    chain = _chain_after(tokens, line, last.end_tok)
     own = {tokens[k].anchor_idx for k in chain if k in match_toks}
     anchor_ids = []
     for k in chain:
@@ -494,13 +563,16 @@ def splice_multi(instructions, smodel, tokens, line, matches, new, codecs):
                 if ei in tok_by_elem:
                     t = tok_by_elem[ei]
                     out.append(pikepdf.String(planned[_key(t)][1]))
+                elif isinstance(e, pikepdf.String):
+                    out.append(e)  # raw string (decoded empty): never destroy
                 # else: kerning number inside the matched span -> dropped
             new_operands = list(operands)
             new_operands[0] = pikepdf.Array(out)
         else:
             t = toks[0]
             new_operands = list(operands)
-            new_operands[0] = pikepdf.String(planned[_key(t)][1])
+            # elem_idx is the string operand's index (0 for Tj/', 2 for ")
+            new_operands[t.elem_idx] = pikepdf.String(planned[_key(t)][1])
         instructions[op_idx] = pikepdf.ContentStreamInstruction(new_operands, operator)
 
 
@@ -548,7 +620,7 @@ def find_continuation(lines, li, hang_tol=40.0):
 
 
 def move_last_word(instructions, smodel, tokens, line, cont, codecs, widths,
-                   after_tok=None):
+                   after_tok=None, fit_right=None):
     """Move the line's trailing word (plus its join space) to the start of
     the continuation line's first run. Returns the moved width in user pt,
     or None when nothing splittable remains.
@@ -574,13 +646,8 @@ def move_last_word(instructions, smodel, tokens, line, cont, codecs, widths,
     moved_word = stripped[sep + 1:]
     if not moved_word.strip():
         return None
-    keep_full = full[: sep + 1]
     moved_text = moved_word + " "
 
-    # every touched token must share one font so the moved text renders
-    # identically at the continuation's first run
-    fonts = {tokens[k].font_key for k, txt in zip(tail_ids, texts)
-             if txt and (not tokens[k].text.strip() or True)}
     touched_fonts = set()
     off = 0
     for k, txt in zip(tail_ids, texts):
@@ -605,6 +672,12 @@ def move_last_word(instructions, smodel, tokens, line, cont, codecs, widths,
         return None
     moved_w = fw.text_width(moved_text, codec, tokens[tail_ids[-1]].size)
     if moved_w is None:
+        return None
+    moved_w_user = moved_w * tokens[tail_ids[-1]].ctm_a
+    # the continuation must absorb the word without overflowing its own
+    # boundary (previously unchecked — moves silently overlapped the
+    # continuation's right column)
+    if fit_right is not None and cont.max_x1 + moved_w_user > fit_right:
         return None
 
     smodel.changed = True
@@ -632,7 +705,23 @@ def move_last_word(instructions, smodel, tokens, line, cont, codecs, widths,
     cont_first = tokens[cont.token_ids[0]]
     _write_operand_bytes(instructions, cont_first.op_idx,
                          cont_first.elem_idx, data_moved, prepend=True)
-    return moved_w * tokens[tail_ids[-1]].ctm_a
+    # the continuation's OTHER positioned runs must follow the inserted
+    # word — previously they stayed put and the line self-overlapped
+    shifted = set()
+    for k in cont.token_ids[1:]:
+        t = tokens[k]
+        if t.anchor_idx == cont_first.anchor_idx or t.anchor_idx in shifted:
+            continue
+        if t.anchor_op in POS_OPS and t.anchor_x_pos >= 0:
+            ins = instructions[t.anchor_idx]
+            operands = list(ins.operands)
+            operands[t.anchor_x_pos] = (
+                float(operands[t.anchor_x_pos])
+                + moved_w_user / (t.anchor_k_x or 1.0))
+            instructions[t.anchor_idx] = pikepdf.ContentStreamInstruction(
+                operands, ins.operator)
+            shifted.add(t.anchor_idx)
+    return moved_w_user
 
 
 def _write_operand_bytes(instructions, op_idx, elem_idx, data, prepend=False):
@@ -646,9 +735,9 @@ def _write_operand_bytes(instructions, op_idx, elem_idx, data, prepend=False):
         arr[elem_idx] = pikepdf.String(new)
         new_operands[0] = pikepdf.Array(arr)
     else:
-        old = bytes(operands[0])
+        old = bytes(operands[elem_idx])
         new = data + old if prepend else data
-        new_operands[0] = pikepdf.String(new)
+        new_operands[elem_idx] = pikepdf.String(new)
     instructions[op_idx] = pikepdf.ContentStreamInstruction(new_operands, operator)
 
 
@@ -673,7 +762,8 @@ def fit_line_by_moves(smodel, tokens, lines, line_y, fit_right, delta,
         movable = cont is not None
         if movable:
             moved = move_last_word(instructions, smodel, tokens, line, cont,
-                                   codecs, widths, after_tok=end_tok)
+                                   codecs, widths, after_tok=end_tok,
+                                   fit_right=fit_right)
             if not moved:
                 movable = False
         if not movable:

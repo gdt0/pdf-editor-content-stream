@@ -131,15 +131,24 @@ def build_codec(font) -> tuple:
     if subtype in _CID_SUBTYPES:
         if to_unicode is None:
             return None, "%s (%s): Type0 font without /ToUnicode" % (label, subtype)
-        cmap = parse_tounicode(to_unicode.read_bytes())
+        try:
+            cmap = parse_tounicode(to_unicode.read_bytes())
+        except Exception as e:
+            return None, "%s (%s): ToUnicode unreadable: %s: %s" % (
+                label, subtype, type(e).__name__, e)
         if not cmap.cid2uni:
             return None, "%s (%s): ToUnicode CMap has no usable entries" % (label, subtype)
         return CMapFontCodec(cmap, label), None
 
     if subtype in _SIMPLE_SUBTYPES:
         if to_unicode is not None:
-            cmap = parse_tounicode(to_unicode.read_bytes())
-            if cmap.cid2uni:
+            # a broken ToUnicode must not kill a font that has a usable
+            # base encoding — fall through to the /Encoding path instead
+            try:
+                cmap = parse_tounicode(to_unicode.read_bytes())
+            except Exception:
+                cmap = None
+            if cmap is not None and cmap.cid2uni:
                 return CMapFontCodec(cmap, label), None
         enc = font.get("/Encoding")
         base = None

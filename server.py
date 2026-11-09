@@ -1,5 +1,7 @@
 """FastAPI server for PDF content stream editing."""
+import logging
 import os
+import time
 import uuid
 import shutil
 import json
@@ -9,6 +11,8 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pdf_editor import edit_pdf
 from verify import VerificationError
+
+log = logging.getLogger("pdf-editor.server")
 
 app = FastAPI(title="PDF Content Stream Editor")
 
@@ -21,6 +25,8 @@ app.add_middleware(
 )
 
 MAX_UPLOAD_BYTES = 25 * 1024 * 1024
+MAX_REPLACEMENTS_BYTES = 1024 * 1024   # the JSON form field is unbounded otherwise
+OUTPUT_TTL_SECONDS = 24 * 3600         # outputs/ is pruned to this age
 
 UPLOAD_DIR = os.path.join(os.path.dirname(__file__), "uploads")
 OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "outputs")
@@ -28,6 +34,23 @@ STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 os.makedirs(STATIC_DIR, exist_ok=True)
+
+
+def _prune_outputs():
+    """Delete stale edited_*.pdf files so outputs/ cannot grow unbounded."""
+    try:
+        now = time.time()
+        for name in os.listdir(OUTPUT_DIR):
+            if not name.startswith("edited_"):
+                continue
+            path = os.path.join(OUTPUT_DIR, name)
+            try:
+                if now - os.path.getmtime(path) > OUTPUT_TTL_SECONDS:
+                    os.remove(path)
+            except OSError:
+                pass
+    except OSError:
+        pass
 
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
@@ -69,6 +92,10 @@ async def edit_pdf_endpoint(
 
     if not isinstance(reps, dict) or not reps:
         raise HTTPException(400, "No replacements provided")
+    if len(replacements) > MAX_REPLACEMENTS_BYTES:
+        raise HTTPException(413, "replacements field exceeds 1 MB limit")
+
+    _prune_outputs()
 
     file_id = str(uuid.uuid4())
     pdf_path = os.path.join(UPLOAD_DIR, f"{file_id}.pdf")
@@ -103,14 +130,17 @@ async def edit_pdf_endpoint(
     except Exception as e:
         if os.path.exists(out_path):
             os.remove(out_path)
-        raise HTTPException(500, f"Edit failed: {str(e)}")
+        log.exception("edit failed for upload %s", file_id)
+        # generic message: raw exception text leaks paths/library internals
+        raise HTTPException(500, "Edit failed (internal error); "
+                                 "see server logs for details")
     finally:
         if os.path.exists(pdf_path):
             os.remove(pdf_path)
 
     headers = {
         "X-Replacements-Made": str(result["replacements_made"]),
-        "X-Verification": "pass",
+        "X-Verification": "skipped" if verify_mode == "0" else "pass",
         "X-Missing-Glyphs": str(len(result.get("missing_glyphs", []))),
     }
     if verify_mode == "json":

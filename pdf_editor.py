@@ -17,6 +17,7 @@ Usage:
     find_pdf("in.pdf", "old")   # occurrence listing (read-only)
 """
 import json
+import os
 
 import pikepdf
 from pikepdf import parse_content_stream, unparse_content_stream
@@ -64,13 +65,15 @@ class _StreamCtx:
     """One editable content stream: page main stream, Form XObject or
     annotation appearance (item 15)."""
 
-    def __init__(self, sid, page_no, page, instructions, fonts_map, writeback):
+    def __init__(self, sid, page_no, page, instructions, fonts_map, writeback,
+                 kind="page"):
         self.sid = sid
         self.page_no = page_no
         self.page = page
         self.instructions = instructions
         self.codecs, self.widths = _split_fonts(fonts_map)
         self.writeback = writeback
+        self.kind = kind  # "page" | "xobject" | "annot"
         self.model = StreamModel(stream_id=sid, instructions=instructions)
         self.tokens = []
         self.lines = []
@@ -98,15 +101,29 @@ class _StreamCtx:
 
 
 def _fonts_map(resources):
-    """{name: codec} + {name::widths: FontWidths} + {name: skip_reason}."""
+    """{name: codec} + {name::widths: FontWidths} + {name: skip_reason}.
+
+    A malformed font dict (garbage /Widths, non-stream /ToUnicode, ...) is
+    recorded in `skipped` with a reason — it must degrade this one font,
+    never kill the whole edit."""
     fonts = {}
     skipped = {}
     for fname, fobj in ((resources or {}).get("/Font") or {}).items():
         key = str(fname).lstrip("/")
-        codec, reason = build_codec(fobj)
+        try:
+            codec, reason = build_codec(fobj)
+        except Exception as e:
+            skipped[key] = "malformed font dict: %s: %s" % (
+                type(e).__name__, e)
+            continue
         if codec is not None:
-            fonts[key] = codec
-            fonts[key + _W_SUFFIX] = build_widths(fobj)
+            try:
+                fonts[key] = codec
+                fonts[key + _W_SUFFIX] = build_widths(fobj)
+            except Exception as e:
+                fonts.pop(key, None)
+                skipped[key] = "unmeasurable font: %s: %s" % (
+                    type(e).__name__, e)
         elif reason:
             skipped[key] = reason
     return fonts, skipped
@@ -140,7 +157,7 @@ def _collect_streams(pdf, page_errors, fonts_skipped):
                     target.write(unparse_content_stream(instrs))
 
         streams.append(_StreamCtx(sid, page_no, page, instructions,
-                                  fonts, writeback))
+                                  fonts, writeback, kind=kind))
 
     for page_no, page in enumerate(pdf.pages, 1):
         res = _page_resources(page)
@@ -185,7 +202,9 @@ def _collect_streams(pdf, page_errors, fonts_skipped):
 def find_pdf(input_path, query, case_sensitive=True):
     """Read-only occurrence listing (item 12): matches with identity.
 
-    Returns a list of {id, page, y, x, text, context, stream} dicts.
+    Returns {"matches": [{id, page, y, x, text, context, stream}, ...],
+    "page_errors": [...]} — pages whose streams failed to parse are
+    reported, not silently absent from the results.
     """
     pdf = pikepdf.open(input_path)
     page_errors = []
@@ -206,7 +225,7 @@ def find_pdf(input_path, query, case_sensitive=True):
                 "stream": sc.sid,
             })
     pdf.close()
-    return out
+    return {"matches": out, "page_errors": page_errors}
 
 
 def edit_pdf(input_path, output_path, replacements, verify=False,
@@ -236,6 +255,13 @@ def edit_pdf(input_path, output_path, replacements, verify=False,
     """
     if fit not in ("reflow", "shift", "refuse"):
         raise ValueError("fit must be one of reflow|shift|refuse")
+
+    if os.path.abspath(input_path) == os.path.abspath(output_path):
+        # the writeback happens in memory, but save() would then overwrite
+        # the input mid-flight and crash with a half-edited file on disk
+        raise ValueError(
+            "output_path must differ from input_path — in-place edits are "
+            "not supported")
 
     for old, new_text in replacements.items():
         if not isinstance(old, str) or not old:
@@ -346,7 +372,6 @@ def edit_pdf(input_path, output_path, replacements, verify=False,
                 ops_mutated += count
                 matched[old] = True
                 budget -= count
-                sc.rescan()
             except FitRefused as e:
                 matched[old] = True  # the text WAS found; refused for cause
                 if spliced:
@@ -355,31 +380,38 @@ def edit_pdf(input_path, output_path, replacements, verify=False,
                     count = len(group)
                     applied[old] += count
                     ops_mutated += count
-                    matched[old] = True
                     budget -= count
+                    sc.rescan()  # instructions changed; keep the model fresh
+                else:
+                    budget -= len(group)
                 if e.reason == "UNENCODABLE":
                     missing_glyphs.append({
                         "old": old, "new": new_text,
                         "missing_chars": e.details.get("missing", []),
                     })
-                    matched[old] = True
                 else:
                     fit_refusals.append({
                         "target": old, "reason": e.reason,
-                        "details": e.details,
+                        "details": e.details, "partial": bool(spliced),
                     })
-                budget -= len(group)
                 break  # this target hit an obstacle; keep the model current
-            sc.rescan()
 
+    write_errors = []
     for sc in streams:
         if sc.model.changed:
             try:
                 sc.writeback(sc.instructions, True)
             except Exception as e:
-                page_errors.append({
-                    "page": sc.page_no, "error": "write-back failed: %s" % e,
-                })
+                write_errors.append(
+                    "page %d: %s" % (sc.page_no, e))
+
+    if write_errors:
+        # never save a half-edited file that reports replacements made —
+        # a failed write-back means the output would lie about its content
+        pdf.close()
+        raise RuntimeError(
+            "stream write-back failed for %d stream(s): %s"
+            % (len(write_errors), "; ".join(write_errors)))
 
     pdf.save(output_path)
     pdf.close()

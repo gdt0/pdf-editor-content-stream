@@ -15,9 +15,7 @@ import fitz
 import pikepdf
 from pikepdf import parse_content_stream, unparse_content_stream
 
-from fontcodec import build_codec
-from widths import build_widths
-from textmodel import _scan_stream, _cluster_lines
+from textmodel import _inv, _mul, _scan_stream, _cluster_lines
 
 
 # ── inspect ─────────────────────────────────────────────────────────────
@@ -58,50 +56,50 @@ def inspect_pdf(path):
     pdf = pikepdf.open(path)
     pages = []
     for pno, page in enumerate(pdf.pages, 1):
-        fonts, _ = _fonts_map(page)
-        codecs, widths = {}, {}
-        for k, v in fonts.items():
-            if k.endswith("::widths"):
-                widths[k[: -len("::widths")]] = v
-            else:
-                codecs[k] = v
-        instrs = list(parse_content_stream(page))
-        ctm = _base_transform(instrs)
-        tokens = _scan_stream(instrs, pno - 1, codecs, widths)
-        lines = _cluster_lines(tokens)
-        line_map = []
-        for ln in lines:
-            txt = "".join(tokens[k].text for k in ln.token_ids)
-            line_map.append({"y": round(ln.y, 2), "x0": round(ln.min_x0, 2),
-                             "x1": round(ln.max_x1, 2), "text": txt[:120]})
-        pages.append({
-            "page": pno,
-            "width": round(float(page.mediabox[2]) - float(page.mediabox[0]), 2),
-            "height": round(float(page.mediabox[3]) - float(page.mediabox[1]), 2),
-            "rotation": int(page.get("/Rotate", 0) or 0),
-            "base_transform": {"a": round(ctm[0], 4), "b": round(ctm[1], 4),
-                               "c": round(ctm[2], 4), "d": round(ctm[3], 4),
-                               "e": round(ctm[4], 2), "f": round(ctm[5], 2)},
-            "flipped": ctm[3] < 0,
-            "scaled": abs(abs(ctm[3]) - 1.0) > 0.01,
-            "fonts": sorted({t.font_key for t in tokens}),
-            "n_lines": len(lines),
-            "lines": line_map,
-        })
+        try:
+            codecs, widths = _page_font_maps(page)
+            instrs = list(parse_content_stream(page))
+            ctm = _base_transform(instrs)
+            tokens = _scan_stream(instrs, pno - 1, codecs, widths)
+            lines = _cluster_lines(tokens)
+            line_map = []
+            for ln in lines:
+                txt = "".join(tokens[k].text for k in ln.token_ids)
+                line_map.append({"y": round(ln.y, 2), "x0": round(ln.min_x0, 2),
+                                 "x1": round(ln.max_x1, 2), "text": txt[:120]})
+            pages.append({
+                "page": pno,
+                "width": round(float(page.mediabox[2]) - float(page.mediabox[0]), 2),
+                "height": round(float(page.mediabox[3]) - float(page.mediabox[1]), 2),
+                "rotation": int(page.get("/Rotate", 0) or 0),
+                "base_transform": {"a": round(ctm[0], 4), "b": round(ctm[1], 4),
+                                   "c": round(ctm[2], 4), "d": round(ctm[3], 4),
+                                   "e": round(ctm[4], 2), "f": round(ctm[5], 2)},
+                "flipped": ctm[3] < 0,
+                "scaled": abs(abs(ctm[3]) - 1.0) > 0.01,
+                "fonts": sorted({t.font_key for t in tokens}),
+                "n_lines": len(lines),
+                "lines": line_map,
+            })
+        except Exception as e:
+            # one corrupt page must not abort the whole inspection
+            pages.append({"page": pno,
+                          "error": "inspection failed: %s: %s"
+                                   % (type(e).__name__, e)})
     pdf.close()
     return {"path": str(path), "pages": pages}
 
 
-def _fonts_map(page):
-    from pdf_editor import _page_resources
+def _page_font_maps(page):
+    """(codecs, widths) for a page's fonts, via pdf_editor's guarded
+    build (this was previously a same-named, different-signature duplicate
+    of pdf_editor._fonts_map)."""
+    from pdf_editor import _fonts_map, _page_resources
 
-    codecs, widths = {}, {}
-    for fname, fobj in ((_page_resources(page) or {}).get("/Font") or {}).items():
-        key = str(fname).lstrip("/")
-        codec, _reason = build_codec(fobj)
-        if codec is not None:
-            codecs[key] = codec
-            widths[key] = build_widths(fobj)
+    fonts, _skipped = _fonts_map(_page_resources(page))
+    codecs = {k: v for k, v in fonts.items() if not k.endswith("::widths")}
+    widths = {k[: -len("::widths")]: v
+              for k, v in fonts.items() if k.endswith("::widths")}
     return codecs, widths
 
 
@@ -112,8 +110,8 @@ def find_overlaps(path, min_frac=0.25, max_pairs=200):
     significantly (the signature of an overprinting edit).
 
     Renderer-truthful: measured on MuPDF's word boxes, so it catches what a
-    viewer actually shows. Returns a list of dicts
-    {page, a, b, frac} sorted worst-first.
+    viewer actually shows. Returns a dict {count, pairs, truncated} where
+    pairs is a list of {page, a, b, frac} dicts sorted worst-first.
     """
     doc = fitz.open(path)
     out = []
@@ -169,8 +167,14 @@ def shift_region(input_path, output_path, dy=0.0, dx=0.0, y0=None, y1=None,
     from pdf_editor import _collect_streams
     page_errors = []
     streams = _collect_streams(pdf, page_errors, {})
+    # main page streams only: tokens from Form XObjects / annotations live
+    # in the XOBJECT's coordinate space, not the page space the region
+    # bounds are expressed in — shifting them by page-space rules would
+    # move the wrong things
     contexts = [sc for sc in streams
-                if page is None or sc.page_no == page]
+                if (page is None or sc.page_no == page)
+                and sc.kind == "page"]
+    text_any = text_any or None  # an empty filter list must not select nothing
 
     y_lo = y0 if y0 is not None else -1e9
     y_hi = y1 if y1 is not None else 1e9
@@ -194,7 +198,7 @@ def shift_region(input_path, output_path, dy=0.0, dx=0.0, y0=None, y1=None,
         for t in sc.tokens:
             if not (y_lo <= t.y <= y_hi):
                 continue
-            if x_lo is not None and not (x_lo <= t.x0 <= x_hi):
+            if not (x_lo <= t.x0 <= x_hi):
                 continue
             if text_any is not None:
                 lt = line_text_by_anchor.get(t.anchor_idx)
@@ -269,22 +273,48 @@ def shift_region(input_path, output_path, dy=0.0, dx=0.0, y0=None, y1=None,
 
 
 def _shift_vectors(sc, y_lo, y_hi, x_lo, x_hi, dx, dy):
-    """Shift path/rect ops whose reference point is inside the region."""
+    """Shift path/rect ops whose reference point is inside the region.
+
+    Region bounds are USER space: each op's raw coordinates convert through
+    the CURRENT CTM for the region test (previously raw operands were
+    compared against user-space bounds directly), and the delta applies
+    through the CTM's inverse linear part — so on flipped/scaled pages
+    vectors move the same direction and distance as text."""
+    ctm = (1.0, 0.0, 0.0, 1.0, 0.0, 0.0)
+    stack = []
     for idx, ins in enumerate(sc.instructions):
         operands, operator = ins.operands, ins.operator
         op = str(operator)
+        if op == "q":
+            stack.append(ctm)
+            continue
+        if op == "Q":
+            if stack:
+                ctm = stack.pop()
+            continue
+        if op == "cm" and len(operands) >= 6:
+            ctm = _mul(tuple(float(v) for v in operands[:6]), ctm)
+            continue
         ypos = {"re": 1, "m": 1, "l": 1}.get(op)
         if ypos is None or len(operands) <= ypos:
             continue
         try:
-            vy = float(operands[ypos])
-            vx = float(operands[0])
+            vx, vy = float(operands[0]), float(operands[ypos])
         except (TypeError, ValueError):
             continue
-        if y_lo <= vy <= y_hi and x_lo <= vx <= x_hi:
-            new_operands = list(operands)
-            new_operands[ypos] = vy + dy
-            new_operands[0] = vx + dx
-            sc.instructions[idx] = pikepdf.ContentStreamInstruction(
-                new_operands, operator)
+        ux = vx * ctm[0] + vy * ctm[2] + ctm[4]
+        uy = vx * ctm[1] + vy * ctm[3] + ctm[5]
+        if not (y_lo <= uy <= y_hi and x_lo <= ux <= x_hi):
+            continue
+        try:
+            ictm = _inv(ctm)
+        except ValueError:
+            continue  # singular CTM: cannot convert, leave the op alone
+        rdx = ictm[0] * dx + ictm[1] * dy
+        rdy = ictm[2] * dx + ictm[3] * dy
+        new_operands = list(operands)
+        new_operands[ypos] = vy + rdy
+        new_operands[0] = vx + rdx
+        sc.instructions[idx] = pikepdf.ContentStreamInstruction(
+            new_operands, operator)
     sc.model.changed = True

@@ -240,3 +240,53 @@ def test_find_in_lines_empty_query_returns_empty():
     matches instead of an infinite loop."""
     from textmodel import find_in_lines
     assert find_in_lines([], [], "") == []
+
+
+def test_malformed_font_skips_with_reason_not_crash(tmp_path):
+    """One malformed font dict (here: /ToUnicode that is not a stream)
+    must be recorded in fonts_skipped with a reason — the edit itself
+    still succeeds for text in the well-formed font."""
+    import pikepdf
+
+    content = (
+        "BT /F1 12 Tf 72 700 Td (broken) Tj ET\n"
+        "BT /F2 12 Tf 72 660 Td (hello) Tj ET\n"
+    ).encode("latin-1")
+    pdf = pikepdf.new()
+    page = pdf.add_blank_page(page_size=(612, 792))
+    page.Contents = pdf.make_stream(content)
+    page.Resources = pikepdf.Dictionary(Font=pikepdf.Dictionary(
+        F1=pikepdf.Dictionary(
+            Type=pikepdf.Name.Font, Subtype=pikepdf.Name.Type1,
+            BaseFont=pikepdf.Name.Helvetica,
+            # broken ToUnicode (not a stream) AND no /Encoding: genuinely
+            # undecodable -> must be skipped with a reason, not crash
+            ToUnicode=pikepdf.Name("/NotAStream")),
+        F2=pikepdf.Dictionary(
+            Type=pikepdf.Name.Font, Subtype=pikepdf.Name.Type1,
+            BaseFont=pikepdf.Name.Helvetica,
+            Encoding=pikepdf.Name.WinAnsiEncoding),
+    ))
+    src = tmp_path / "in.pdf"
+    pdf.save(str(src))
+    pdf.close()
+
+    out = tmp_path / "out.pdf"
+    result = edit_pdf(str(src), str(out), {"hello": "world"})
+    assert result["replacements_made"] == 1
+    assert "F1" in result["fonts_skipped"]
+    assert "ToUnicode" in result["fonts_skipped"]["F1"]
+
+
+def test_same_input_output_path_rejected(corpus_file):
+    p = str(corpus_file("F1_basic_tounicode.pdf"))
+    with pytest.raises(ValueError, match="differ"):
+        edit_pdf(p, p, {"alpha": "beta"})
+
+
+def test_find_pdf_reports_matches_and_page_errors(corpus_file):
+    from pdf_editor import find_pdf
+    res = find_pdf(corpus_file("F1_basic_tounicode.pdf"), "alpha")
+    assert isinstance(res, dict)
+    assert res["page_errors"] == []
+    assert any(m["text"] == "alpha" for m in res["matches"])
