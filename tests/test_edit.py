@@ -211,3 +211,32 @@ def test_write_back_survives_roundtrip(corpus_file, tmp_path):
     out = tmp_path / "out.pdf"
     edit_pdf(corpus_file("F6_simple_tounicode.pdf"), str(out), {"pending": "done"})
     assert "done" in _text(out)
+
+
+def test_empty_query_rejected_not_hung(corpus_file, tmp_path):
+    """P0 regression: an empty old-text key must fail validation fast —
+    it used to spin forever in find_in_lines (hay.find('') never
+    advances), hanging the server request and exhausting memory."""
+    out = tmp_path / "out.pdf"
+    with pytest.raises(ValueError):
+        edit_pdf(
+            corpus_file("F1_basic_tounicode.pdf"), str(out), {"": "x"},
+        )
+
+
+def test_non_string_replacement_value_rejected(corpus_file, tmp_path):
+    """Server contract: values must be strings so a JSON null/number fails
+    as a clean 400 ValueError, not a TypeError deep in the engine."""
+    out = tmp_path / "out.pdf"
+    with pytest.raises(ValueError):
+        edit_pdf(
+            corpus_file("F1_basic_tounicode.pdf"), str(out),
+            {"alpha": None},
+        )
+
+
+def test_find_in_lines_empty_query_returns_empty():
+    """Library-level guard: any caller passing an empty needle gets no
+    matches instead of an infinite loop."""
+    from textmodel import find_in_lines
+    assert find_in_lines([], [], "") == []

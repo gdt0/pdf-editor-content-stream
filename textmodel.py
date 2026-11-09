@@ -282,6 +282,10 @@ class Match:
 
 def find_in_lines(tokens, lines, query, case_sensitive=True):
     """Cross-operator occurrences of `query` within clustered lines."""
+    if not query:
+        # an empty needle never advances .find(), so the loop below would
+        # match forever and exhaust memory — refuse instead of hanging
+        return []
     matches = []
     for li, line in enumerate(lines):
         ids = line.token_ids

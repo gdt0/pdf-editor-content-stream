@@ -218,10 +218,6 @@ def _route_streams(sc, cut_y, shift, move_threshold, dy2, page_errors):
             t0 = next((t for t in tokens if t.anchor_idx == idx), None)
             if t0 is not None:
                 errs.append((idx, round(dy, 2), round(t0.y - orig_anchor_y[idx], 2)))
-        print("   CALIB iter: k=%s applied[ase-like]=%s errs[:3]=%s n_movable=%d"
-              % (round(k, 4) if k else k,
-                 round(applied.get(movable[0][0], 0), 2) if movable else None,
-                 errs[:3], len(movable)))
         if not errs or all(abs(e[1] - e[2]) < 0.5 for e in errs):
             converged = True
             break
@@ -266,7 +262,10 @@ def _route_streams(sc, cut_y, shift, move_threshold, dy2, page_errors):
     # partition the positioned part; per-page q/Q rebalance for the routed
     # ops only (the prefixes are balanced by construction)
     page1 = list(sc.instructions[:prefix_end])
-    page2 = list(prefix)
+    # page 2 exists only if real content routed there — a prefix-only
+    # stream would mint a blank page even in the everything-fits case
+    page2 = list(prefix) if any(dest == "2" for _i, dest, _d
+                                in routes[prefix_end:]) else []
     balance = {"1": 0, "2": 0}
     for (idx, dest, _dy), ins in zip(routes[prefix_end:],
                                      sc.instructions[prefix_end:]):
@@ -533,6 +532,14 @@ def insert_experience_block(input_path, output_path, title, dates, bullets,
             break
     dy2 = TOP_MARGIN_REF - move_threshold if move_threshold is not None else 0.0
 
+    # move_threshold None = no unit crosses the bottom margin, so NOTHING
+    # routes to page 2 — everything below the cut stays on page 1 shifted
+    # by -H. Route with a threshold below every y to make that explicit
+    # (passing anchor_y here used to dump the whole lower half onto an
+    # unshifted mid-page page 2).
+    route_threshold = (move_threshold if move_threshold is not None
+                       else float("-inf"))
+
     # cut between the heading above and the anchor role: the new block takes
     # the anchor's slot, so the anchor line itself must shift too
     ys_above = [ln.y for ln in lines
@@ -541,8 +548,7 @@ def insert_experience_block(input_path, output_path, title, dates, bullets,
     if ys_above:
         cut_y = (anchor_y + min(ys_above)) / 2.0
     page1_instrs, page2_instrs, ctm_final = _route_streams(
-        sc, cut_y, -H, move_threshold if move_threshold is not None
-        else anchor_y, dy2, page_errors)
+        sc, cut_y, -H, route_threshold, dy2, page_errors)
 
     # emit the new block at the anchor's slot — runs the subset fonts
     # cannot encode fall back to an embedded Times New Roman resource

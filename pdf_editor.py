@@ -237,6 +237,15 @@ def edit_pdf(input_path, output_path, replacements, verify=False,
     if fit not in ("reflow", "shift", "refuse"):
         raise ValueError("fit must be one of reflow|shift|refuse")
 
+    for old, new_text in replacements.items():
+        if not isinstance(old, str) or not old:
+            raise ValueError(
+                "replacement keys (old text) must be non-empty strings")
+        if not isinstance(new_text, str):
+            raise ValueError(
+                "replacement values (new text) must be strings, got %s"
+                % type(new_text).__name__)
+
     pdf = pikepdf.open(input_path)
     applied = {old: 0 for old in replacements}
     matched = {old: False for old in replacements}
