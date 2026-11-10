@@ -14,6 +14,7 @@ Everything the insertion moves is declared to the verification harness
 that nothing OUTSIDE the declared blast radius changed.
 """
 import os
+from collections import Counter
 
 import pikepdf
 from pikepdf import unparse_content_stream
@@ -23,28 +24,47 @@ from widths import build_widths
 from textmodel import (_inv, _mul, _scan_stream, _cluster_lines,
                        find_in_lines, line_by_y)
 
+# fallbacks only — real geometry is derived from the document itself
 TOP_MARGIN_REF = 788.10   # page 1's first baseline (name line)
-BOTTOM_MARGIN = 31.0      # matches this template's ~33pt symmetric margin
+BOTTOM_MARGIN = 31.0      # matches the reference template's ~33pt margin
 BAND = 16.0               # touched-region padding around a baseline
+LINE_SLACK = 2.0          # descender depth allowance below a baseline
+# bullet-marker characters recognized in the document's own lists (the
+# inserted block clones whichever one the document uses)
+_BULLET_CHARS = "\u2022\u2023\u25aa\u25e6\u2219\u00b7\u2013-"
+_BULLET_SET = set(_BULLET_CHARS)
+_BULLET_PREFIXES = tuple(_BULLET_CHARS)  # for str.startswith
 
 
 def _line_text(tokens, line):
     return "".join(tokens[k].text for k in line.token_ids)
 
 
-def _detect_header_font(tokens, lines, anchor_y):
+def _detect_left_margin(tokens, lines):
+    """Dominant left text edge, char-weighted, over the page's lines.
+
+    Mode (not min) keeps two-column documents on the main column (a
+    sidebar column never out-weighs the body). Replaces the hard-coded
+    33pt that only matched the reference template."""
+    counts = Counter()
+    for ln in lines:
+        if ln.token_ids:
+            counts[round(ln.min_x0)] += sum(
+                len(tokens[k].text) for k in ln.token_ids)
+    return float(counts.most_common(1)[0][0]) if counts else 33.0
+
+
+def _detect_header_font(tokens, lines, anchor_y, left_margin):
     """Section headers: single-font, left-margin, short lines above the
     anchor ('Experience', 'Projects', ...). Their common font is the
     document's heading font."""
-    from collections import Counter
-
     counts = Counter()
     for ln in lines:
         if ln.y >= anchor_y:
             continue
         toks = [tokens[k] for k in ln.token_ids]
         keys = {t.font_key for t in toks}
-        if len(keys) != 1 or abs(ln.min_x0 - 33.0) > 2.0:
+        if len(keys) != 1 or abs(ln.min_x0 - left_margin) > 2.0:
             continue
         txt = "".join(t.text for t in toks).strip()
         if 0 < len(txt) < 30:
@@ -52,9 +72,9 @@ def _detect_header_font(tokens, lines, anchor_y):
     return counts.most_common(1)[0][0] if counts else None
 
 
-def _is_section_header(tokens, line, header_font):
+def _is_section_header(tokens, line, header_font, left_margin):
     toks = [tokens[k] for k in line.token_ids]
-    if not toks or abs(line.min_x0 - 33.0) > 2.0:
+    if not toks or abs(line.min_x0 - left_margin) > 2.0:
         return False
     keys = {t.font_key for t in toks}
     txt = "".join(t.text for t in toks).strip()
@@ -69,16 +89,23 @@ def _measure_layout(tokens, lines, anchor_y, title_font):
     as the anchor's title (role titles share one font in a resume) — not a
     hard-coded resource name."""
     bullet_lines = [ln for ln in lines if 0 < ln.y < anchor_y + 1
-                    and _line_text(tokens, ln).lstrip().startswith("\u2022")]
+                    and _line_text(tokens, ln).lstrip().startswith(_BULLET_PREFIXES)]
     below_anchor = [ln for ln in lines if ln.y < anchor_y - 0.5]
     d_title_to_bullet = anchor_y - below_anchor[0].y if below_anchor else 18.3
 
-    # single-line bullet pitch: a bullet followed directly by another bullet
+    # single-line bullet pitch: a bullet followed directly by another
+    # bullet; the band is size-relative so compact/dense templates measure
+    # instead of silently falling back to the reference pitch
+    sizes = Counter()
+    for ln in bullet_lines:
+        for k in ln.token_ids:
+            sizes[tokens[k].size] += len(tokens[k].text)
+    bsize = sizes.most_common(1)[0][0] if sizes else 10.0
     ys = [ln.y for ln in bullet_lines]
     pitches = []
     for i in range(len(ys) - 1):
         nxt = ys[i] - ys[i + 1]
-        if 15.0 < nxt < 22.0:  # single-line → single-line pitch band
+        if 1.3 * bsize < nxt < 2.4 * bsize:  # single-line → single-line band
             pitches.append(nxt)
     pitch = pitches[0] if pitches else 18.5
 
@@ -522,7 +549,13 @@ def insert_experience_block(input_path, output_path, title, dates, bullets,
         raise ValueError("anchor role line not found: %r" % anchor_query)
     li, anchor_line = line_by_y(lines, tokens[ms[0].start_tok].y)
     anchor_y = anchor_line.y
+    # the date rail aligns to the anchor's BLOCK extent, not the anchor
+    # line alone: a bare narrow anchor line (a location line under the
+    # role title) would collapse the rail onto the inserted title
     right_edge = anchor_line.max_x1
+    block_band = [ln for ln in lines if anchor_y - 45.0 <= ln.y <= anchor_y + 45.0]
+    if block_band:
+        right_edge = max(right_edge, max(ln.max_x1 for ln in block_band))
 
     def _codec_of(font_key):
         # an exemplar font the codec layer skipped (e.g. Type0 without
@@ -545,34 +578,72 @@ def insert_experience_block(input_path, output_path, title, dates, bullets,
     bullet_line = None
     for ln in lines:
         if anchor_y - 40 < ln.y < anchor_y - 5 and \
-                _line_text(tokens, ln).lstrip().startswith("\u2022"):
+                _line_text(tokens, ln).lstrip().startswith(_BULLET_PREFIXES):
             bullet_line = ln
             break
     if bullet_line is None:
         raise ValueError("no bullet line found below the anchor role")
     btoks = [tokens[k] for k in bullet_line.token_ids]
-    bullet_tok = next(t for t in btoks if t.text.lstrip().startswith("\u2022"))
+    bullet_tok = next(t for t in btoks
+                      if t.text.lstrip().startswith(_BULLET_PREFIXES))
     bullet_font, bullet_size, bullet_x = bullet_tok.font_key, bullet_tok.size, bullet_tok.x0
-    # bold exemplar: the document's heading font (same family used for the
-    # bullet lead words); regular: the dominant body font on this line
-    header_font = _detect_header_font(tokens, lines, anchor_y)
-    if header_font:
-        bold_font = header_font
+    # clone the document's OWN bullet marker (•, ‣, –, ·, ...) — the
+    # inserted block must speak the document's format, not the reference
+    # template's
+    bullet_marker = bullet_tok.text.lstrip()[:1]
+
+    # the document's own left edge (never the reference template's 33pt)
+    left_margin = _detect_left_margin(tokens, lines)
+
+    # page geometry from the document itself — the constants only matched
+    # one template:
+    #   top    = the page's highest baseline (where page-2 content lands)
+    #   bottom = min(symmetric-template estimate from the left margin,
+    #                the page's own lowest ink line). The left-margin
+    #     estimate alone over-refuses bottom-tight templates that already
+    #     set text below it; the lowest BASELINE alone under-refuses
+    #     sparse pages, where it is where text STOPS, not where shifted
+    #     text may GO. The min of the two adapts to both.
+    try:
+        page_bottom = float(sc.page.mediabox[1])
+    except (TypeError, ValueError, IndexError):
+        page_bottom = 0.0
+    top_ref = max(ln.y for ln in lines) if lines else TOP_MARGIN_REF
+    if lines:
+        bottom_margin = min(left_margin,
+                            min(ln.y for ln in lines) - LINE_SLACK)
     else:
-        alt = [t.font_key for t in btoks if t.font_key != bullet_font]
-        if not alt:
-            raise FitError("NO_BOLD_EXEMPLAR",
-                           {"bullet_font": bullet_font})
-        bold_font = alt[0]
-    bold_size = bullet_size
+        bottom_margin = BOTTOM_MARGIN
+    bottom_margin = max(bottom_margin, page_bottom + 12.0)
+
+    # exemplars: BODY font first (char-weighted dominant on the bullet
+    # line, excluding the bullet glyph itself), then bold = the heading
+    # font when it differs. A single-font document degrades to body-font
+    # bold leads (recorded as bold_font_source="body") instead of
+    # refusing — nothing is corrupted, only the weight is lost, and the
+    # verification harness still gates the result.
+    header_font = _detect_header_font(tokens, lines, anchor_y, left_margin)
     body_counts = {}
     for t in btoks:
-        if t is not bullet_tok and t.font_key != bold_font:
-            body_counts[t.font_key] = body_counts.get(t.font_key, 0) + len(t.text)
+        stripped = t.text.strip()
+        if stripped and set(stripped) <= _BULLET_SET:
+            # a dedicated bullet-glyph run (reference-template style);
+            # inline bullets (plain resumes) live INSIDE the body run and
+            # must be counted — excluding the first token by identity
+            # threw away the whole line there
+            continue
+        body_counts[t.font_key] = body_counts.get(t.font_key, 0) + len(t.text)
     if not body_counts:
         raise FitError("NO_BODY_EXEMPLAR", {"bullet_font": bullet_font})
     reg_font = max(body_counts, key=body_counts.get)
     reg_size = next(t.size for t in btoks if t.font_key == reg_font)
+    if header_font and header_font != reg_font:
+        bold_font = header_font
+        bold_font_source = "header"
+    else:
+        bold_font = reg_font
+        bold_font_source = "body"
+    bold_size = bullet_size
     bullet_codec = _codec_of(bullet_font)
     bold_codec = _codec_of(bold_font)
     bold_fw = sc.widths[bold_font]
@@ -588,7 +659,7 @@ def insert_experience_block(input_path, output_path, title, dates, bullets,
 
     # sections (keep-together units): header line + body until next header
     headers = [li2 for li2, ln in enumerate(lines)
-               if _is_section_header(tokens, ln, header_font)]
+               if _is_section_header(tokens, ln, header_font, left_margin)]
     units = []  # (start line idx, end line idx exclusive)
     if headers:
         bounds = headers + [len(lines)]
@@ -608,11 +679,11 @@ def insert_experience_block(input_path, output_path, title, dates, bullets,
         uls = [lines[i] for i in range(a, b) if lines[i].y < anchor_y - 0.5]
         if uls:
             first_unit_min = min(ln.y for ln in uls)
-            if first_unit_min - H < BOTTOM_MARGIN:
+            if first_unit_min - H < bottom_margin:
                 raise FitError("DOES_NOT_FIT", {
                     "needed_shift": round(H, 2),
                     "first_unit_end_y": round(first_unit_min - H, 2),
-                    "bottom_margin": BOTTOM_MARGIN,
+                    "bottom_margin": round(bottom_margin, 2),
                 })
             break
 
@@ -625,12 +696,12 @@ def insert_experience_block(input_path, output_path, title, dates, bullets,
         uls = [lines[i] for i in range(a, b) if lines[i].y < anchor_y - 0.5]
         if not uls:
             continue
-        if min(ln.y for ln in uls) - H < BOTTOM_MARGIN:
+        if min(ln.y for ln in uls) - H < bottom_margin:
             # threshold sits ABOVE the unit's topmost line: the whole unit
             # (and everything below it) routes to page 2
             move_threshold = max(ln.y for ln in uls) + BAND + 1.0
             break
-    dy2 = TOP_MARGIN_REF - move_threshold if move_threshold is not None else 0.0
+    dy2 = top_ref - move_threshold if move_threshold is not None else 0.0
 
     # move_threshold None = no unit crosses the bottom margin, so NOTHING
     # routes to page 2 — everything below the cut stays on page 1 shifted
@@ -671,15 +742,28 @@ def insert_experience_block(input_path, output_path, title, dates, bullets,
         runs.append((fk, size, x, y, text, codec))
         return w
 
-    title_w = add_run(title_font, title_size, "italic", 33.0, new_title_y,
-                      title)
+    # the new title takes the anchor's slot — at the anchor line's own
+    # left edge (was the reference template's 33pt literal)
+    title_x = anchor_line.min_x0
+    title_w = add_run(title_font, title_size, "italic", title_x,
+                      new_title_y, title)
     date_w = add_run(title_font, title_size, "italic", 0.0, new_title_y,
                      dates)
+    # the dates are right-aligned to the block's right rail — they must
+    # actually FIT beside the title (previously unchecked: a long title
+    # and a short anchor line made the rail collapse onto the title text)
+    if title_x + title_w > right_edge - date_w - 12.0:
+        raise FitError("TITLE_DATES_COLLIDE", {
+            "title_end": round(title_x + title_w, 2),
+            "dates_start": round(right_edge - date_w, 2),
+            "right_edge": round(right_edge, 2),
+        })
     runs[-1] = (runs[-1][0], runs[-1][1], right_edge - date_w, runs[-1][3],
                 runs[-1][4], runs[-1][5])
     for (bold_lead, rest), by in zip(bullets, bullet_ys):
         x = bullet_x
-        x += add_run(bullet_font, bullet_size, "regular", x, by, "\u2022 ")
+        x += add_run(bullet_font, bullet_size, "regular", x, by,
+                     bullet_marker + " ")
         x += add_run(bold_font, bold_size, "bold", x, by, bold_lead + " ")
         add_run(reg_font, reg_size, "regular", x, by, rest)
 
@@ -701,11 +785,16 @@ def insert_experience_block(input_path, output_path, title, dates, bullets,
     pdf.close()
 
     inserted_lines = ([title, dates] +
-                      ["• %s %s" % (b[0], b[1]) for b in bullets])
+                      ["%s %s %s" % (bullet_marker, b[0], b[1])
+                       for b in bullets])
     result = {
         "inserted_lines": inserted_lines,
         "shift": round(-H, 2),
         "new_page": new_page_index,
+        # "header" = bullet leads cloned the document's heading font;
+        # "body" = single-font document, leads degrade to the body font
+        "bold_font_source": bold_font_source,
+        "left_margin": round(left_margin, 2),
         "touched_regions": [
             {"page": 1, "y0": bullet_ys[-1] - BAND,
              "y1": new_title_y + BAND, "x0": 0.0, "x1": 10 ** 6},

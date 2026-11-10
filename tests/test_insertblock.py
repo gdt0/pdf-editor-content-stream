@@ -159,3 +159,97 @@ def test_insert_large_block_moves_overflow_to_page2(synth_resume, tmp_path):
         assert len(doc.pages) == 2
     finally:
         doc.close()
+
+
+# ── non-reference-template regressions (service corpus resume-01/21/41) ──
+
+def test_48pt_margin_single_font_bullets(synth_factory, tmp_path):
+    """Root cause 1 (margin-48 docs): header detection was pinned to
+    x0≈33 AND the bold fallback needed a second font ON the bullet line.
+    Plain resumes (single-font bullet lines at any other margin) refused
+    with NO_BOLD_EXEMPLAR. Now the margin derives from the document and
+    the header font supplies the bold exemplar."""
+    path = synth_factory(left_margin=48.0, single_font_bullets=True)
+    out = tmp_path / "out.pdf"
+    result = insert_experience_block(
+        path, str(out),
+        "PLATFORM ENGINEER", "Jan 2025 - Present",
+        [("Led", "the platform team across services"),
+         ("Built", "internal tooling for engineers")],
+        anchor_query=ANCHOR,
+        verify=True,
+    )
+    assert result["verification"]["ok"]
+    assert result["bold_font_source"] == "header"
+    assert result["left_margin"] == 48.0
+    doc = pikepdf.open(str(out))
+    try:
+        assert len(doc.pages) == 1
+    finally:
+        doc.close()
+
+
+def test_single_font_document_degrades_bold(synth_factory, tmp_path):
+    """Root causes 2+3 (resume-21 class): a single-font document used to
+    refuse (header detection returned the body font -> empty body
+    candidates). Now it degrades: bold leads render in the body font and
+    the choice is reported."""
+    path = synth_factory(left_margin=34.0, single_font=True)
+    out = tmp_path / "out.pdf"
+    result = insert_experience_block(
+        path, str(out),
+        "PLATFORM ENGINEER", "Jan 2025 - Present",
+        [("Led", "the platform team across services"),
+         ("Built", "internal tooling for engineers")],
+        anchor_query=ANCHOR,
+        verify=True,
+    )
+    assert result["verification"]["ok"]
+    assert result["bold_font_source"] == "body"
+    assert result["left_margin"] == 34.0
+
+
+def test_bullet_marker_is_cloned(synth_factory, tmp_path):
+    """En-dash documents (resume-31/35 class): the inserted block must use
+    the document's OWN bullet marker, not the hard-coded U+2022."""
+    import fitz
+
+    path = synth_factory(bullet_marker="\u2013")
+    out = tmp_path / "out.pdf"
+    result = insert_experience_block(
+        path, str(out),
+        "PLATFORM ENGINEER", "Jan 2025 - Present",
+        [("Led", "the platform team across services"),
+         ("Built", "internal tooling for engineers")],
+        anchor_query=ANCHOR,
+        verify=True,
+    )
+    assert result["verification"]["ok"]
+    doc = fitz.open(str(out))
+    try:
+        text = doc[0].get_text("text")
+    finally:
+        doc.close()
+    assert "\u2013 Led the platform team across services" in text
+    assert result["inserted_lines"][2].startswith("\u2013")
+
+
+def test_long_title_collides_with_dates(synth_resume, tmp_path):
+    """The dates rail is right-aligned to the block's right edge — a title
+    wider than the rail minus the dates must refuse honestly instead of
+    rendering the two runs on top of each other (found on the service
+    corpus: frac-1.0 'Analyst'/'2023' overprints)."""
+    from insertblock import FitError
+
+    out = tmp_path / "out.pdf"
+    with pytest.raises(FitError) as exc:
+        insert_experience_block(
+            synth_resume, str(out),
+            "Platform Engineering Lead for Distributed Systems and Global "
+            "Infrastructure Operations Worldwide 2025",
+            "Jan 2025 - Present",
+            [("Led", "the platform team")],
+            anchor_query=ANCHOR,
+            verify=False,
+        )
+    assert exc.value.reason == "TITLE_DATES_COLLIDE"

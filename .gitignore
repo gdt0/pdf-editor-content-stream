@@ -11,3 +11,6 @@ _v7_insert.py
 # explicitly tracked)
 *.pdf
 !corpus/*.pdf
+
+# local virtualenv
+.venv/
