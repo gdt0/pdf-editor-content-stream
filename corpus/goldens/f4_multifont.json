@@ -1,0 +1,51 @@
+{
+  "checks": [
+    {
+      "details": {
+        "targets": 2
+      },
+      "name": "applicability",
+      "passed": true
+    },
+    {
+      "details": {
+        "pages": {
+          "edited": 1,
+          "original": 1
+        }
+      },
+      "name": "structure",
+      "passed": true
+    },
+    {
+      "details": {
+        "changed_strings": 2,
+        "pages_checked": 1,
+        "positioning_ops_changed": 0
+      },
+      "name": "stream_diff",
+      "passed": true
+    },
+    {
+      "details": {
+        "mismatches": [],
+        "pages_checked": 1
+      },
+      "name": "text_extract",
+      "passed": true
+    },
+    {
+      "details": {
+        "dpi": [
+          150,
+          300
+        ],
+        "outside_mask_pixels": 0
+      },
+      "name": "pixel_diff",
+      "passed": true
+    }
+  ],
+  "ok": true,
+  "warnings": []
+}

@@ -1,214 +1,486 @@
 """
-PDF Content Stream Editor
-Edits PDF text by modifying raw content stream operators (Tj/TJ).
-Parses font ToUnicode CMaps to decode CID-encoded text.
-Zero format change — only text bytes are modified.
+PDF Content Stream Editor (Phase 3: token-model engine)
+
+Edits PDF text through a positioned token model: text is decoded across
+operator boundaries into lines, matches carry occurrence identity, and the
+write path splices replacements at the code level, drops TJ kerning numbers
+inside replaced spans, shifts same-flow positioned runs by the measured
+width delta, and — when a line would overflow its page's fit boundary —
+moves trailing words to the continuation line (limited reflow). When it
+cannot fit, the edit is REFUSED with DOES_NOT_FIT; nothing is silently
+corrupted.
 
 Usage:
-    from pdf_editor import edit_pdf
+    from pdf_editor import edit_pdf, find_pdf
 
-    edit_pdf("input.pdf", "output.pdf", {"old text": "new text"})
+    edit_pdf("in.pdf", "out.pdf", {"old": "new"}, verify=True)
+    find_pdf("in.pdf", "old")   # occurrence listing (read-only)
 """
-import re
+import json
+import os
+
 import pikepdf
 from pikepdf import parse_content_stream, unparse_content_stream
 
-
-def _parse_tounicode_cmap(stream_bytes: bytes) -> dict:
-    """Parse a PDF ToUnicode CMap stream → {CID: unicode_char}"""
-    text = stream_bytes.decode("latin-1", errors="replace")
-    cid2uni = {}
-
-    for m in re.finditer(r"beginbfchar\s*(.*?)\s*endbfchar", text, re.DOTALL):
-        for pair in re.finditer(r"<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>", m.group(1)):
-            cid = int(pair.group(1), 16)
-            uni = int(pair.group(2), 16)
-            if uni < 0x110000:
-                cid2uni[cid] = chr(uni)
-
-    for m in re.finditer(r"beginbfrange\s*(.*?)\s*endbfrange", text, re.DOTALL):
-        for rng in re.finditer(r"<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>", m.group(1)):
-            start = int(rng.group(1), 16)
-            end = int(rng.group(2), 16)
-            base = int(rng.group(3), 16)
-            for cid in range(start, end + 1):
-                target = base + (cid - start)
-                if target < 0x110000:
-                    cid2uni[cid] = chr(target)
-    return cid2uni
+from fontcodec import build_codec
+from widths import build_widths
+from textmodel import (
+    FitRefused,
+    StreamModel,
+    _cluster_lines,
+    _scan_stream,
+    find_in_lines,
+    fit_line_by_moves,
+    line_by_y,
+    plan_multi,
+    shift_anchors,
+    splice_multi,
+)
 
 
-def _extract_font_maps(pdf, page) -> dict:
-    """Extract {font_name: {'cid2uni': ..., 'uni2cid': ...}} for a page."""
-    fonts = {}
-    resources = page.get("/Resources", {})
-    font_dict = resources.get("/Font", {}) if resources else {}
-    if not font_dict:
-        return fonts
+def _page_resources(page):
+    """Page /Resources, walking up the /Pages tree for inherited resources."""
+    node = page
+    for _ in range(8):
+        res = node.get("/Resources")
+        if res is not None:
+            return res
+        node = node.get("/Parent")
+        if node is None:
+            break
+    return None
 
-    for fname, fobj in font_dict.items():
-        name = str(fname).lstrip("/")
-        to_unicode = fobj.get("/ToUnicode")
-        if not to_unicode:
-            continue
+
+_W_SUFFIX = "::widths"
+
+
+def _split_fonts(fonts_map):
+    codecs = {k: v for k, v in fonts_map.items() if not k.endswith(_W_SUFFIX)}
+    widths = {k[: -len(_W_SUFFIX)]: v
+              for k, v in fonts_map.items() if k.endswith(_W_SUFFIX)}
+    return codecs, widths
+
+
+class _StreamCtx:
+    """One editable content stream: page main stream, Form XObject or
+    annotation appearance (item 15)."""
+
+    def __init__(self, sid, page_no, page, instructions, fonts_map, writeback,
+                 kind="page"):
+        self.sid = sid
+        self.page_no = page_no
+        self.page = page
+        self.instructions = instructions
+        self.codecs, self.widths = _split_fonts(fonts_map)
+        self.writeback = writeback
+        self.kind = kind  # "page" | "xobject" | "annot"
+        self.model = StreamModel(stream_id=sid, instructions=instructions)
+        self.tokens = []
+        self.lines = []
+        self.rescan()
+        # The fit boundary is the page's ORIGINAL typography — computed once
+        # from the untouched model, so a widened line cannot redefine its
+        # own boundary. The HARD boundary is the physical page edge.
+        xs = [t.x1 for t in self.tokens if t.x1 is not None]
+        self._fit_right = max(xs) if xs else None
         try:
-            cid2uni = _parse_tounicode_cmap(to_unicode.read_bytes())
-            fonts[name] = {
-                "cid2uni": cid2uni,
-                "uni2cid": {v: k for k, v in cid2uni.items()},
-            }
+            self._hard_right = float(page.mediabox[2]) - 2.0
         except Exception:
-            pass
-    return fonts
+            self._hard_right = None
+
+    def hard_right(self):
+        return self._hard_right
+
+    def rescan(self):
+        self.tokens = _scan_stream(self.instructions, self.sid,
+                                   self.codecs, self.widths)
+        self.lines = _cluster_lines(self.tokens)
+
+    def fit_right(self):
+        return self._fit_right
 
 
-def _decode_cid(raw_bytes: bytes, cid2uni: dict) -> str:
-    """Decode 2-byte CID string to Unicode."""
-    result = []
-    for i in range(0, len(raw_bytes), 2):
-        if i + 1 < len(raw_bytes):
-            cid = (raw_bytes[i] << 8) | raw_bytes[i + 1]
-            result.append(cid2uni.get(cid, ""))
-    return "".join(result)
+def _fonts_map(resources):
+    """{name: codec} + {name::widths: FontWidths} + {name: skip_reason}.
+
+    A malformed font dict (garbage /Widths, non-stream /ToUnicode, ...) is
+    recorded in `skipped` with a reason — it must degrade this one font,
+    never kill the whole edit."""
+    fonts = {}
+    skipped = {}
+    for fname, fobj in ((resources or {}).get("/Font") or {}).items():
+        key = str(fname).lstrip("/")
+        try:
+            codec, reason = build_codec(fobj)
+        except Exception as e:
+            skipped[key] = "malformed font dict: %s: %s" % (
+                type(e).__name__, e)
+            continue
+        if codec is not None:
+            try:
+                fonts[key] = codec
+                fonts[key + _W_SUFFIX] = build_widths(fobj)
+            except Exception as e:
+                fonts.pop(key, None)
+                skipped[key] = "unmeasurable font: %s: %s" % (
+                    type(e).__name__, e)
+        elif reason:
+            skipped[key] = reason
+    return fonts, skipped
 
 
-def _encode_cid(text: str, uni2cid: dict) -> bytes:
-    """Encode Unicode to 2-byte CID bytes."""
-    result = bytearray()
-    for ch in text:
-        cid = uni2cid.get(ch)
-        if cid is not None:
-            result.append((cid >> 8) & 0xFF)
-            result.append(cid & 0xFF)
-    return bytes(result)
+def _collect_streams(pdf, page_errors, fonts_skipped):
+    """Page main streams + Form XObjects + annotation /AP normal streams."""
+    streams = []
+    seen = set()
+
+    def add(page_no, page, target, resources, kind):
+        fonts, skip = _fonts_map(resources)
+        for name, reason in skip.items():
+            fonts_skipped.setdefault(name, reason)
+        try:
+            instructions = list(parse_content_stream(target))
+        except Exception as e:
+            page_errors.append({"page": page_no,
+                                "error": "parse failed (%s): %s" % (kind, e)})
+            return
+        sid = len(streams)
+
+        if kind == "page":
+            def writeback(instrs, changed, page=page):
+                if changed:
+                    page.Contents = pdf.make_stream(
+                        unparse_content_stream(instrs))
+        else:
+            def writeback(instrs, changed, target=target):
+                if changed:
+                    target.write(unparse_content_stream(instrs))
+
+        streams.append(_StreamCtx(sid, page_no, page, instructions,
+                                  fonts, writeback, kind=kind))
+
+    for page_no, page in enumerate(pdf.pages, 1):
+        res = _page_resources(page)
+        add(page_no, page, page, res, "page")
+
+        def walk_xobjects(resources, seen):
+            for _name, xobj in ((resources or {}).get("/XObject") or {}).items():
+                if str(xobj.get("/Subtype", "")) != "/Form":
+                    continue
+                try:
+                    key = xobj.objgen if xobj.is_indirect else None
+                except Exception:
+                    key = None
+                if key is not None and key in seen:
+                    continue
+                if key is not None:
+                    seen.add(key)
+                sub_res = xobj.get("/Resources") or resources
+                add(page_no, page, xobj, sub_res, "xobject")
+                walk_xobjects(sub_res, seen)
+
+        walk_xobjects(res, seen)
+
+        for annot in page.get("/Annots", []) or []:
+            ap = annot.get("/AP")
+            n = ap.get("/N") if ap is not None else None
+            if not isinstance(n, pikepdf.Stream):
+                continue
+            try:
+                key = n.objgen if n.is_indirect else None
+            except Exception:
+                key = None
+            if key is not None and key in seen:
+                continue
+            if key is not None:
+                seen.add(key)
+            add(page_no, page, n, n.get("/Resources") or res, "annot")
+
+    return streams
 
 
-def edit_pdf(input_path: str, output_path: str, replacements: dict) -> dict:
-    """
-    Edit text in a PDF by modifying content stream operators directly.
+def find_pdf(input_path, query, case_sensitive=True):
+    """Read-only occurrence listing (item 12): matches with identity.
 
-    Args:
-        input_path: Path to input PDF
-        output_path: Path for output PDF
-        replacements: Dict of {old_text: new_text} to replace
-
-    Returns:
-        dict with 'replacements_made' count and any 'missing_glyphs'
-
-    Raises:
-        ValueError: If no replacements were made (text not found or encoding issue)
+    Returns {"matches": [{id, page, y, x, text, context, stream}, ...],
+    "page_errors": [...]} — pages whose streams failed to parse are
+    reported, not silently absent from the results.
     """
     pdf = pikepdf.open(input_path)
-    total = 0
+    page_errors = []
+    streams = _collect_streams(pdf, page_errors, {})
+    out = []
+    mid = 0
+    for sc in streams:
+        for m in find_in_lines(sc.tokens, sc.lines, query, case_sensitive):
+            t = sc.tokens[m.start_tok]
+            mid += 1
+            out.append({
+                "id": mid,
+                "page": sc.page_no,
+                "y": round(t.y, 2),
+                "x": round(t.x0, 2),
+                "text": m.text,
+                "context": m.context(sc.tokens),
+                "stream": sc.sid,
+            })
+    pdf.close()
+    return {"matches": out, "page_errors": page_errors}
 
-    for page in pdf.pages:
-        font_maps = _extract_font_maps(pdf, page)
-        if not font_maps:
-            continue
 
-        try:
-            instructions = parse_content_stream(page)
-        except Exception:
-            continue
+def edit_pdf(input_path, output_path, replacements, verify=False,
+             dpi=(150, 300), fit="reflow"):
+    """
+    Edit text in a PDF via the token-model engine.
 
-        current_font = None
+    Args:
+        replacements: {old_text: new_text} — every occurrence is replaced;
+            use find_pdf() first for occurrence identity.
+        verify: run the verification harness on the saved output
+        dpi: DPI list for the pixel-diff check
+        fit: 'reflow' (default) — shift same-flow runs and move trailing
+                words to the continuation line when needed;
+             'shift' — shift runs but refuse if the line would overflow;
+             'refuse' — only exact in-place fits, refuse anything that
+                would move other content.
 
-        for operands, operator in instructions:
-            op = str(operator)
+    Returns:
+        dict with replacements_made, applied, not_found, missing_glyphs,
+        fonts_skipped, page_errors, fit_actions, fit_refusals,
+        touched_regions, reflowed, verification (when verify=True).
 
-            if op == "Tf" and len(operands) >= 1:
-                current_font = str(operands[0]).lstrip("/")
-                continue
+    Raises:
+        ValueError: if no replacements could be applied
+        VerificationError: if verify=True and the harness rejects the output
+    """
+    if fit not in ("reflow", "shift", "refuse"):
+        raise ValueError("fit must be one of reflow|shift|refuse")
 
-            if current_font not in font_maps:
-                continue
+    if os.path.abspath(input_path) == os.path.abspath(output_path):
+        # the writeback happens in memory, but save() would then overwrite
+        # the input mid-flight and crash with a half-edited file on disk
+        raise ValueError(
+            "output_path must differ from input_path — in-place edits are "
+            "not supported")
 
-            maps = font_maps[current_font]
-            cid2uni = maps["cid2uni"]
-            uni2cid = maps["uni2cid"]
+    for old, new_text in replacements.items():
+        if not isinstance(old, str) or not old:
+            raise ValueError(
+                "replacement keys (old text) must be non-empty strings")
+        if not isinstance(new_text, str):
+            raise ValueError(
+                "replacement values (new text) must be strings, got %s"
+                % type(new_text).__name__)
 
-            # ── Tj: simple string ──
-            if op == "Tj" and len(operands) == 1:
-                decoded = _decode_cid(bytes(operands[0]), cid2uni)
-                new_decoded = decoded
-                for old, new in replacements.items():
-                    new_decoded = new_decoded.replace(old, new)
-                if new_decoded != decoded:
-                    encoded = _encode_cid(new_decoded, uni2cid)
-                    if encoded:
-                        operands[0] = pikepdf.String(encoded)
-                        total += 1
+    pdf = pikepdf.open(input_path)
+    applied = {old: 0 for old in replacements}
+    matched = {old: False for old in replacements}
+    ops_mutated = 0
+    missing_glyphs = []
+    fonts_skipped = {}
+    page_errors = []
+    fit_actions = []
+    fit_refusals = []
+    touched_regions = []
+    reflowed = False
+    shifted = False
 
-            # ── TJ: array with kerning offsets ──
-            elif op == "TJ" and len(operands) == 1:
-                arr = operands[0]
-                if not isinstance(arr, pikepdf.Array):
-                    continue
+    streams = _collect_streams(pdf, page_errors, fonts_skipped)
 
-                # Decode all string elements
-                str_parts = []
-                full_text = ""
-                for elem_idx, elem in enumerate(arr):
-                    if isinstance(elem, pikepdf.String):
-                        decoded = _decode_cid(bytes(elem), cid2uni)
-                        str_parts.append((elem_idx, decoded, len(full_text)))
-                        full_text += decoded
+    for old, new_text in replacements.items():
+        budget = None
+        spliced = False
+        while True:
+            matches = [(sc, m) for sc in streams
+                       for m in find_in_lines(sc.tokens, sc.lines, old)]
+            if budget is None:
+                budget = len(matches)
+            if not matches or budget <= 0:
+                break
+            spliced = False
+            sc, m = matches[0]
+            li, line = line_by_y(sc.lines, sc.tokens[m.start_tok].y)
+            group = [mm for msc, mm in matches
+                     if msc is sc and mm.line_idx == li]
+            try:
+                delta, anchor_ids = plan_multi(
+                    sc.tokens, line, group, old, new_text,
+                    sc.codecs, sc.widths)
+                limit = sc.fit_right()
+                predicted_end = line.max_x1 + delta
+                if delta != 0 and fit == "refuse":
+                    raise FitRefused("DOES_NOT_FIT", {
+                        "reason": "policy=refuse and width changes by %.2fpt"
+                                  % delta,
+                    })
+                if delta != 0 and limit is not None \
+                        and predicted_end > limit:
+                    if fit == "shift":
+                        raise FitRefused("DOES_NOT_FIT", {
+                            "reason": "policy=shift forbids overflow",
+                            "predicted_line_end": round(predicted_end, 2),
+                            "fit_right": round(limit, 2),
+                        })
+                    if fit == "reflow":
+                        # Limited reflow BEFORE the splice: move trailing
+                        # words (only from runs after the match) so the line
+                        # converges; then splice+shift the remainder.
+                        moved = fit_line_by_moves(
+                            sc.model, sc.tokens, sc.lines, line.y,
+                            limit, delta, m.end_tok, sc.codecs, sc.widths,
+                            sc.instructions, touched_regions,
+                            hard_right=sc.hard_right())
+                        if moved:
+                            reflowed = True
+                            # the model changed — re-find this target's match
+                            # on the same line and re-plan the anchors
+                            fresh = [mm for mm in
+                                     find_in_lines(sc.tokens, sc.lines, old)
+                                     if abs(sc.tokens[mm.start_tok].y
+                                            - line.y) <= 2.0]
+                            if not fresh:
+                                raise FitRefused("DOES_NOT_FIT", {
+                                    "reason": "match lost during reflow",
+                                })
+                            li, line = line_by_y(sc.lines,
+                                                 sc.tokens[fresh[0].start_tok].y)
+                            group = fresh
+                            delta, anchor_ids = plan_multi(
+                                sc.tokens, line, group, old, new_text,
+                                sc.codecs, sc.widths)
+                splice_multi(sc.instructions, sc.model, sc.tokens, line,
+                             group, new_text, sc.codecs)
+                spliced = True
+                if delta != 0 and anchor_ids:
+                    shift_anchors(sc.instructions, sc.model, anchor_ids,
+                                  delta, sc.tokens)
+                    shifted = True
+                sc.rescan()
 
-                # Apply replacements
-                for old, new in replacements.items():
-                    search_start = 0
-                    while True:
-                        pos = full_text.find(old, search_start)
-                        if pos == -1:
-                            break
+                touched_regions.append({
+                    "page": sc.page_no,
+                    "y0": line.y - 16, "y1": line.y + 16,
+                    "x0": 0.0, "x1": 10 ** 6,
+                })
+                fit_actions.append({
+                    "target": old, "page": sc.page_no,
+                    "line_y": round(line.y, 2), "delta_pt": round(delta, 2),
+                    "shifted_runs": len(anchor_ids), "mode": fit,
+                })
+                count = len(group)
+                applied[old] += count
+                ops_mutated += count
+                matched[old] = True
+                budget -= count
+            except FitRefused as e:
+                matched[old] = True  # the text WAS found; refused for cause
+                if spliced:
+                    # the splice landed; only the shift/reflow stage failed —
+                    # count honestly and record what could not be completed
+                    count = len(group)
+                    applied[old] += count
+                    ops_mutated += count
+                    budget -= count
+                    sc.rescan()  # instructions changed; keep the model fresh
+                else:
+                    budget -= len(group)
+                if e.reason == "UNENCODABLE":
+                    missing_glyphs.append({
+                        "old": old, "new": new_text,
+                        "missing_chars": e.details.get("missing", []),
+                    })
+                else:
+                    fit_refusals.append({
+                        "target": old, "reason": e.reason,
+                        "details": e.details, "partial": bool(spliced),
+                    })
+                break  # this target hit an obstacle; keep the model current
 
-                        end_pos = pos + len(old)
-                        first_elem = None
-                        for ei, edec, estart in str_parts:
-                            if estart <= pos < estart + len(edec):
-                                first_elem = (ei, estart, len(edec))
-                                break
-                        if not first_elem:
-                            break
+    write_errors = []
+    for sc in streams:
+        if sc.model.changed:
+            try:
+                sc.writeback(sc.instructions, True)
+            except Exception as e:
+                write_errors.append(
+                    "page %d: %s" % (sc.page_no, e))
 
-                        first_ei, first_start, first_len = first_elem
-                        prefix = full_text[first_start:pos]
-                        new_first_text = prefix + new
-
-                        if all(ch in uni2cid for ch in new_first_text):
-                            arr[first_ei] = pikepdf.String(
-                                _encode_cid(new_first_text, uni2cid)
-                            )
-                            for ei, edec, estart in str_parts:
-                                if estart > first_start and estart < end_pos:
-                                    arr[ei] = pikepdf.String(b"")
-                                elif estart >= end_pos:
-                                    break
-                            total += 1
-
-                        # Update full_text for subsequent searches
-                        full_text = full_text[:pos] + new + full_text[end_pos:]
-                        delta = len(new) - len(old)
-                        new_parts = []
-                        for ei, edec, estart in str_parts:
-                            offset = delta if estart >= pos else 0
-                            new_parts.append((ei, edec, estart + offset))
-                        str_parts = new_parts
-                        search_start = pos + len(new)
-
-        # Write modified stream back
-        try:
-            page.Contents = pdf.make_stream(unparse_content_stream(instructions))
-        except Exception:
-            pass
+    if write_errors:
+        # never save a half-edited file that reports replacements made —
+        # a failed write-back means the output would lie about its content
+        pdf.close()
+        raise RuntimeError(
+            "stream write-back failed for %d stream(s): %s"
+            % (len(write_errors), "; ".join(write_errors)))
 
     pdf.save(output_path)
     pdf.close()
 
-    if total == 0:
-        raise ValueError(
-            "No replacements made. The target text may be split across "
-            "operators or uses an encoding this tool cannot parse."
-        )
+    not_found = [old for old, was in matched.items() if not was]
+    result = {
+        "replacements_made": ops_mutated,
+        "applied": {old: count for old, count in applied.items() if count},
+        "not_found": not_found,
+        "missing_glyphs": _dedupe(missing_glyphs),
+        "fonts_skipped": fonts_skipped,
+        "page_errors": page_errors,
+        "fit_actions": fit_actions,
+        "fit_refusals": fit_refusals,
+        "touched_regions": touched_regions,
+        "reflowed": reflowed,
+    }
 
-    return {"replacements_made": total}
+    if verify and ops_mutated > 0:
+        from verify import verify_pdf, VerificationError
+
+        applied_reps = {
+            old: replacements[old] for old, count in applied.items() if count
+        }
+        report = verify_pdf(
+            input_path, output_path, applied_reps, dpi=dpi,
+            touched_regions=touched_regions,
+            extraction_mode="words" if reflowed else "exact",
+            allow_positioning=shifted,
+        )
+        result["verification"] = report.to_dict()
+        if not report.ok:
+            raise VerificationError(report, result)
+
+    if ops_mutated == 0:
+        reasons = []
+        if not_found:
+            reasons.append("text not found: %s"
+                           % ", ".join(repr(t) for t in not_found))
+        if result["missing_glyphs"]:
+            chars = sorted({c for m in result["missing_glyphs"]
+                            for c in m["missing_chars"]})
+            reasons.append("glyphs missing from embedded fonts: %s"
+                           % " ".join(chars))
+        for r in fit_refusals:
+            reasons.append("refused %s: %s (%s)" % (
+                repr(r["target"]), r["reason"], _json_compact(r["details"])))
+        if fonts_skipped:
+            reasons.append("fonts could not be decoded: %s"
+                           % "; ".join(fonts_skipped.values()))
+        raise ValueError("No replacements made. "
+                         + ("; ".join(reasons) or "unsupported encoding."))
+
+    return result
+
+
+def _json_compact(d):
+    try:
+        return json.dumps(d, sort_keys=True)
+    except Exception:
+        return str(d)
+
+
+def _dedupe(entries):
+    seen = set()
+    out = []
+    for e in entries:
+        key = (e.get("old"), e.get("new"), tuple(e.get("missing_chars", [])))
+        if key not in seen:
+            seen.add(key)
+            out.append(e)
+    return out

@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+uploads/
+outputs/
+tmp_v7.pdf
+_v7_insert.py
+
+# PDFs are generated artifacts or personal documents — never commit them
+# (the corpus fixtures under corpus/ are deliberate exceptions and stay
+# explicitly tracked)
+*.pdf
+!corpus/*.pdf
+
+# local virtualenv
+.venv/
